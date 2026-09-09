@@ -1,0 +1,20 @@
+{
+  "mission": "",
+  "status": "intake",
+  "conductor": {
+    "session": "",
+    "pid": null,
+    "provider": "",
+    "model": "",
+    "soleOwner": true
+  },
+  "approvals": {
+    "merge": false,
+    "push": false,
+    "publish": false,
+    "destructive": false
+  },
+  "lanes": {},
+  "routeLog": [],
+  "nextAction": ""
+}
