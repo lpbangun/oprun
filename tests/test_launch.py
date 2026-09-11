@@ -375,9 +375,13 @@ def test_git_evidence_names_every_changed_path_exactly(tmp_path: Path) -> None:
     (worktree / ".oprun").mkdir()
     (worktree / ".oprun" / "result.x.json").write_text("{}\n", encoding="utf-8")
 
-    evidence = advance._git_evidence(worktree)
+    evidence = advance.git_evidence(worktree)
 
-    assert evidence["commit"] == head
+    # The lane has NOT committed: HEAD is still the base commit, so nothing may name it as the
+    # lane's commit (that base SHA dressed up as the lane's work is the v0.2 evidence defect).
+    # The content hashes below are the only thing that identifies this work.
+    assert evidence["commit"] is None
+    assert evidence["commit"] != head
     assert evidence["uncommitted"] is True
     assert set(evidence["hashes"]) == {"work.txt", "new.txt", ".oprun/"}
     assert re.fullmatch(r"[0-9a-f]{64}", evidence["hashes"]["work.txt"] or "")
@@ -386,7 +390,7 @@ def test_git_evidence_names_every_changed_path_exactly(tmp_path: Path) -> None:
 
 
 def test_git_evidence_records_missing_git_instead_of_guessing(tmp_path: Path) -> None:
-    evidence = advance._git_evidence(tmp_path)          # not a repository at all
+    evidence = advance.git_evidence(tmp_path)           # not a repository at all
     assert evidence["commit"] is None
     assert evidence["hashes"] == {}
     assert evidence["git_error"]
