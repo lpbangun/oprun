@@ -15,8 +15,10 @@ Three rules are load-bearing:
    controller re-runs the lane's own ``test_cmd`` to exit 0. Nothing else can accept a lane. A
    dead unit with a valid sidecar is done; a live unit with no sidecar is not.
 2. **A unit's lifetime answers "should I keep waiting?" — never "is it done?"** (see
-   :func:`_unit_finished`). It is used to stop waiting on a provably-exited worker, never as a
-   completion signal.
+   :func:`_unit_lifetime`). At the deadline it decides exactly one thing: whether a *missing*
+   sidecar is still possible. A still-active unit is left alone (the worker may be about to write
+   its evidence); a finished-or-absent one makes the silence final, so the dispatch is settled as
+   a **failure**. Lifetime can never accept a lane — acceptance is evidence only.
 3. **Every loop is bounded.** The runner returns when the lanes are decided or when the deadline
    passes. A lane that fails is *parked*, not retried blindly: the ledger's circuit breaker owns
    the failure streak, and a ``blocked`` lane is terminal as far as this process is concerned.
@@ -273,6 +275,28 @@ def _unit_finished(lane_id: str) -> bool | None:
         return None
 
 
+def _unit_lifetime(lane_id: str) -> str:
+    """Classify the lane's unit as ``"active"``, ``"finished"`` or ``"absent"``.
+
+    This three-way answer is what a *missing sidecar* is judged by, and nothing else is:
+
+    * ``"active"``  — the unit is running right now. The worker may still write its evidence, so
+      the lane must keep waiting and must **never** be settled here: failing a live worker invents
+      a failure and poisons the circuit-breaker streak.
+    * ``"finished"``— systemd reports the main process exited, so no sidecar is coming.
+    * ``"absent"``  — systemd holds no record (never created, or ``--collect`` already removed it)
+      and has no exit to report. Nothing is running under this lane's unit either, so the same
+      conclusion holds: no artifact will appear.
+
+    ``active`` is tested first so a live lane is never re-classified by a second, slower query.
+    """
+    if _unit_active(lane_id) is True:
+        return "active"
+    if _unit_finished(lane_id) is True:
+        return "finished"
+    return "absent"
+
+
 # --- controller evidence -----------------------------------------------------
 
 
@@ -392,6 +416,27 @@ def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, rea
     return _Decision(lane_id, "parked", category, reason)
 
 
+def _settle_no_evidence(led: Ledger, lane_id: str, dispatch_id: str, *, lifetime: str,
+                        verdict: dict | None, witness: dict | None,
+                        emit: Callable[[str], None]) -> _Decision:
+    """Park a lane that produced no acceptable sidecar and whose unit can no longer produce one.
+
+    ``lifetime`` is :func:`_unit_lifetime`'s answer, and it is what names the ledger reason:
+    ``"finished"`` means systemd watched the worker exit, ``"absent"`` means there is no unit to
+    run under. Both are a failed dispatch — the worker exited, or it never started, and either way
+    no artifact will arrive — so counting it toward the circuit breaker invents nothing.
+
+    ``"active"`` must never reach here: a running worker may still write its evidence, and
+    settling it would poison the failure streak with a failure that did not happen.
+    """
+    if lifetime == "active":
+        raise ValueError("an active unit is never settled: it may still produce evidence")
+    reason = ("unit exited with no acceptable sidecar" if lifetime == "finished"
+              else "no unit and no acceptable sidecar")
+    return _settle_park(led, lane_id, dispatch_id, "evidence", reason, emit,
+                        verdict=verdict, witness=witness)
+
+
 def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
                   emit: Callable[[str], None]) -> _Decision | None:
     """Decide one DISPATCHED lane, or return ``None`` when there is nothing to decide yet."""
@@ -410,8 +455,15 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
     witness = witness_verdict(lane, lane_id=lane_id, unit_active=unit_active,
                               timeout_exceeded=time.monotonic() >= deadline)
     if verdict["case"] == "no_artifact":
-        return _settle_park(led, lane_id, dispatch_id, "evidence", verdict["reason"], emit,
-                            verdict=verdict, witness=witness)
+        # The witness only says "no artifact yet"; the unit's lifetime says whether one can still
+        # arrive. An active unit keeps the lane in flight (a live worker must never be failed); a
+        # finished or absent one makes this a failed dispatch, which is settled rather than left
+        # frozen in ``dispatched`` forever.
+        lifetime = _unit_lifetime(lane_id)
+        if lifetime == "active":
+            return None
+        return _settle_no_evidence(led, lane_id, dispatch_id, lifetime=lifetime, verdict=verdict,
+                                   witness=witness, emit=emit)
     if verdict["verdict"] != DONE:
         return _settle_park(led, lane_id, dispatch_id, "evidence", verdict["reason"], emit,
                             verdict=verdict, witness=witness)
@@ -469,7 +521,17 @@ def advance(ledger_path: Path | str, *, timeout: int = 600, poll: float = 2.0,
     Returns ``{"accepted": [...], "needs_review": [...], "stalled": [...], "timed_out": [...],
     "final": {status: count}}``. It returns when every in-flight lane has been decided or when
     ``timeout`` seconds have passed — whichever comes first. There is no unbounded wait and no
-    daemon: lanes left in flight at the deadline are *reported*, never settled on a hunch.
+    daemon.
+
+    At the deadline the unit's lifetime decides what a missing sidecar means (see
+    :func:`_unit_lifetime`), and it is the only thing that may. A lane whose unit is still
+    **active** is reported in ``timed_out`` and left ``dispatched``: a live worker may still write
+    its evidence, and failing it would invent a failure. A lane whose unit has **finished**
+    (reported in ``stalled``) or is **absent** (reported in ``timed_out``) cannot produce one any
+    more, so it is settled as a failed dispatch: it lands in ``needs_review`` — ``blocked`` once
+    the circuit breaker trips — and never in a non-terminal limbo. ``stalled``/``timed_out``
+    therefore say *why* a lane ran out of clock; a settled lane appears there and in
+    ``needs_review`` both.
 
     Retrying is deliberately absent. A lane that fails is parked; the ledger's circuit breaker
     owns the failure streak, and re-dispatching a genuinely broken lane is a conductor decision
@@ -510,18 +572,48 @@ def advance(ledger_path: Path | str, *, timeout: int = 600, poll: float = 2.0,
             break
         time.sleep(min(poll_s, remaining))
 
-    # Lanes still in flight at the hard stop. Absence of evidence is reported, not settled: the
-    # worker may still be running, and inventing a failure would poison the failure streak.
+    # Lanes still in flight at the hard stop. The unit's LIFETIME is what decides the silence, and
+    # it is the only thing that may:
+    #
+    # * **active** — the worker is running right now, so it is reported as still in flight and left
+    #   ``dispatched``. Absence of evidence is reported, not settled: inventing a failure for a
+    #   worker that may still write its sidecar would poison the failure streak.
+    # * **finished** — systemd saw the main process exit. No sidecar is coming, so this *is* a
+    #   failed dispatch and is settled as one.
+    # * **absent** — there is no unit record and no exit to report, so nothing is running under
+    #   this lane either. Also a failed dispatch, and also settled.
+    #
+    # The last two are the v0.1 failure shape this runner exists to prevent — a ledger frozen in a
+    # non-terminal state with no unit and no artifact to explain it. A lane that produced no
+    # artifact is a failed dispatch, and counting it toward the breaker invents nothing.
     for lane_id in led.dispatched():
         if lane_id in decided:
             continue
-        if _unit_finished(lane_id):
+        lifetime = _unit_lifetime(lane_id)
+        if lifetime == "active":
+            _append_unique(timed_out, lane_id)
+            decided[lane_id] = "timed_out"
+            emit(f"[{lane_id}] TIMED_OUT no acceptable sidecar within {timeout_s:g}s "
+                 f"(unit still active, left dispatched)")
+            continue
+        lane = led.lane(lane_id)
+        # The witness is recorded as corroboration, and told the truth about the unit: "finished"
+        # is a witnessed exit, "absent" is only an absence (never dressed up as an exit).
+        unit_active = False if lifetime == "finished" else None
+        verdict = lane_verdict(lane, lane_id=lane_id, unit_active=unit_active,
+                               timeout_exceeded=True)
+        witness = witness_verdict(lane, lane_id=lane_id, unit_active=unit_active,
+                                  timeout_exceeded=True)
+        decision = _settle_no_evidence(led, lane_id, str(lane.get("dispatch_id") or ""),
+                                       lifetime=lifetime, verdict=verdict, witness=witness,
+                                       emit=emit)
+        decided[lane_id] = decision.kind
+        _append_unique(needs_review, lane_id)
+        if lifetime == "finished":
             _append_unique(stalled, lane_id)
-            decided[lane_id] = STALLED
             emit(f"[{lane_id}] STALLED unit exited with no acceptable sidecar")
         else:
             _append_unique(timed_out, lane_id)
-            decided[lane_id] = "timed_out"
             emit(f"[{lane_id}] TIMED_OUT no acceptable sidecar within {timeout_s:g}s")
 
     final = led.summary()

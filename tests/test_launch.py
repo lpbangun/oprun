@@ -201,6 +201,13 @@ def test_advance_parks_a_lane_whose_controller_test_fails(tmp_path: Path) -> Non
 
 
 def test_advance_returns_within_a_bounded_wall_clock_with_no_evidence(tmp_path: Path) -> None:
+    """A lane with no unit at all and no sidecar is a FAILED dispatch — and advance returns.
+
+    This assertion used to read "no evidence means no settlement — ever", keeping the lane
+    ``dispatched``. That was the defect: a lane whose unit never existed is not in flight, and
+    leaving it dispatched is the v0.1 frozen-ledger shape (no unit running, no artifact coming).
+    Absence of evidence is still never an *acceptance* — it is a failure, and the ledger says so.
+    """
     lane_id = f"nosidecar-{uuid.uuid4().hex[:6]}"     # a unit that provably never existed
     ledger, _ = _ledger_with_lane(tmp_path, lane_id)
     ledger.dispatch(lane_id)
@@ -213,9 +220,13 @@ def test_advance_returns_within_a_bounded_wall_clock_with_no_evidence(tmp_path: 
     assert elapsed < 6.0, f"advance must return when the timeout elapses (took {elapsed:.1f}s)"
     assert summary["accepted"] == []
     assert summary["stalled"] + summary["timed_out"] == [lane_id]
-    # No evidence means no settlement — ever. Inventing a failure would poison the breaker.
-    assert ledger.lane(lane_id)["status"] == DISPATCHED
+    lane = ledger.lane(lane_id)
+    assert lane["status"] in (FAILED, BLOCKED), "no unit and no artifact is not in flight"
+    assert lane["status"] != DISPATCHED
+    assert lane["needs_review_reason"] == "no unit and no acceptable sidecar"
+    assert lane["consecutive_failures"] == 1, "a failed dispatch counts toward the breaker"
     assert any("TIMED_OUT" in line or "STALLED" in line for line in lines)
+    assert any("NEEDS_REVIEW" in line for line in lines)
 
 
 def test_advance_stops_at_the_breaker_and_never_retries_a_parked_lane(tmp_path: Path) -> None:
