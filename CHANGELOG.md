@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.2 — routing surface and verification scars
+
+**Routing:** Claude Code is no longer routed. It is gone from the default table, the adapters
+reference, and the skill's constraints, because the operator does not use it. The **registry entry
+stays**: it is the only harness that exercises `requires_model_pin` (its default model 403s on this
+box) and the only witness that degrades `none` → `strong` once a pin is supplied, and the frozen
+benchmark scores both. Removing it would be a reviewed change, not a doc edit.
+
+**Skill (v0.2.1):** the Pitfalls and Verification sections now encode the two failures this build
+actually hit — verifying that a command *exited* rather than what it *recorded* (a 12/12 run passed
+over an `evidence.commit` that was the base SHA, and a reviewer zeroed the whole build for it), and
+assuming a fix reached every call site when a duplicated helper's stale copy lived in a module that
+never imported the fixed one.
+
 ## v0.2 — the witness
 
 **What v0.1 could not do:** tell whether a *non-Hermes* harness had finished. Its worker set was

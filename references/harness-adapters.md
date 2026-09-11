@@ -7,8 +7,8 @@ on this box 2026-09-11. Registry: `scripts/harnesses.py`; routing is only as saf
 
 **`subtype` alone is never success. Exit code plus `is_error` are authoritative.**
 
-Claude was measured emitting `subtype:"success"` *while* returning `is_error:true` and exit 1.
-A controller that greps for `"success"` accepts a failed run. Always:
+A result event was measured carrying `subtype:"success"` *while* its `is_error` was `true` and the
+process exited 1. A controller that greps for `"success"` accepts a failed run. Always:
 
 1. process **exit code** (0 = success) — the primary signal;
 2. `is_error` in the result event — the corroborating signal;
@@ -54,19 +54,6 @@ evidence. Prose from the agent is neither.
 - **Known failure mode:** omit `--auto` and it prompts for approval and sits idle. Idle is not
   progress and must never be waited on.
 
-## claude
-
-    claude -p --output-format json --model <pin>
-
-- **Success looks like:** a `{"type":"result","subtype":...,"is_error":bool}` event **and**
-  exit 0 **and** `is_error:false`. All three, or it is not success.
-- **Exit code:** authoritative.
-- **Best at:** large multi-file refactors.
-- **Known failure mode:** two of them. (1) Its **default model 403s on this box**, so an
-  unpinned lane fails for reasons that look like a harness bug — pin `--model` explicitly or
-  do not route to it. (2) **`subtype` is a trap**: `subtype:"success"` was measured alongside
-  `is_error:true` and exit 1. Never accept this harness on `subtype`.
-
 ## hermes
 
     HOME=/home/logani hermes -p <profile> chat --query-file <brief>
@@ -106,13 +93,9 @@ evidence. Prose from the agent is neither.
 
 ## Routing constraints
 
-Two facts change routing, and both are encoded in the registry rather than left to judgement:
+One fact changes routing, and it is encoded in the registry rather than left to judgement:
 
-1. **`claude` needs a model pin.** `routable("claude")` is `False` and
-   `model_pin_required("claude")` is `True`; it becomes routable only when a pin is supplied.
-   Without one it 403s on this box, so an unpinned lane is refused at dispatch instead of
-   being launched to fail.
-2. **`opencode` cannot be trusted to report completion.** `witness_strength == "none"`: its
+1. **`opencode` cannot be trusted to report completion.** `witness_strength == "none"`: its
    terminator is dropped, so nothing in its stdout is a verdict. Route it only where a
    re-run is cheap, and accept it on exit code plus a sidecar artifact.
 

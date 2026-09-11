@@ -1,7 +1,7 @@
 ---
 name: oprun
 description: Use when a long-horizon software mission runs via oprun.
-version: 0.2.1
+version: 0.2.2
 author: Logani Bangun (lpbangun), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -75,8 +75,7 @@ prints the envelope so the user can always see what the conductor may do.
 
 **Routing is the user's.** `references/routing.md` is a table the user owns and may override; the
 registry in `scripts/harnesses.py` only states what each CLI's unattended recipe and witness are.
-Two measured constraints are not overridable: `claude` is not routable without an explicit
-`--model`, and `opencode` is not trusted to report completion.
+One measured constraint is not overridable: `opencode` is not trusted to report completion.
 
 ## How to Run
 
