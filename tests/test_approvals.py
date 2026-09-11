@@ -58,10 +58,16 @@ def git_ok(repo: Path, *args: str) -> bool:
     return proc.returncode == 0
 
 
-def run_cli(*args: str, stdin: int = subprocess.DEVNULL) -> subprocess.CompletedProcess:
-    """Run the CLI with stdin **closed** by default: a prompt must never be able to block."""
+def run_cli(*args: str, stdin: int = subprocess.DEVNULL,
+            env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run the CLI with stdin **closed** by default: a prompt must never be able to block.
+
+    The CLI's own ``git commit``/``push``/``merge`` get the same isolated identity as the setup
+    helpers above (``GIT_ENV``), so a host whose ``~/.gitconfig`` carries no ``[user]`` cannot
+    fail a real commit: the suite must behave identically on a clean machine.
+    """
     return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True,
-                          stdin=stdin, timeout=180)
+                          stdin=stdin, timeout=180, env=GIT_ENV if env is None else env)
 
 
 def read_ledger(path: Path) -> dict:
@@ -198,6 +204,44 @@ def test_granted_envelope_settles_commit_push_merge_without_any_prompt(scratch: 
     assert evidence["merge"]["into"] == "main"
     assert evidence["approval_prompt"] is None
     assert evidence["test_exit_code"] == 0
+
+
+def test_settle_commits_with_no_usable_identity_in_the_cli_environment(scratch: dict) -> None:
+    """A host gitconfig without ``[user]`` must not be able to fail the CLI's real commit.
+
+    The child environment is deliberately stripped: no global/system config and every
+    ``GIT_AUTHOR_*``/``GIT_COMMITTER_*``/``GIT_CONFIG*`` the host might export is scrubbed before
+    the test's own identity goes back in — so the commit the CLI runs can only be authorised by
+    ``GIT_ENV``, never by whatever the machine happens to hold.
+    """
+    assert run_cli("init", str(scratch["repo"]), "--mission", "m",
+                   "--approve", "commit,push,merge").returncode == 0
+    dispatch_id = dispatch_lane(scratch)
+    base = git(scratch["worktree"], "rev-parse", "HEAD")
+
+    stripped = {key: value for key, value in os.environ.items()
+                if key not in {"EMAIL", "GIT_ASKPASS"}
+                and not key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG"))}
+    stripped.update({
+        "GIT_AUTHOR_NAME": "oprun test",
+        "GIT_AUTHOR_EMAIL": "oprun@test.local",
+        "GIT_COMMITTER_NAME": "oprun test",
+        "GIT_COMMITTER_EMAIL": "oprun@test.local",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+
+    proc = run_cli("settle", "alpha", "--accept", "--ledger", str(scratch["ledger"]),
+                   env=stripped)
+    assert proc.returncode == 0, proc.stderr
+
+    sha = git(scratch["worktree"], "rev-parse", "HEAD")
+    assert sha != base, "the CLI's own git commit must succeed with no host-held identity"
+    lane = read_ledger(scratch["ledger"])["lanes"]["alpha"]
+    assert lane["status"] == "completed"
+    assert lane["accepted"] == [dispatch_id]
+    assert lane["evidence"]["commit"] == sha, "the commit SHA must be recorded in the evidence"
 
 
 def test_accept_refuses_when_the_lane_test_is_red(scratch: dict) -> None:
