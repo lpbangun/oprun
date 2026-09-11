@@ -50,3 +50,19 @@ hard error that names the known ids.
 Every lane records the model **requested** and the model the worker **reported**, compared
 normalised (casefold, separators dropped) so `"Cursor Grok 4.6"` and `"cursor-grok-4.6"` do not
 read as a substitution. A genuine mismatch is `needs_review` — never a silent pass.
+
+**A pin is only compared where it can be checked.** `Harness.pin_verifiable` says whether anything
+the CLI itself emits names the model that ran. Where it cannot — `codex` is the measured case
+(`codex exec --json` emits `thread.started`/`turn.started`/`item.completed`/`turn.completed` and no
+model id at all) — a reported mismatch is recorded as an `identity_warning` and the lane is decided
+on its real evidence, because a difference there may be the CLI's naming rather than a substitution.
+Only a measurement may lower this flag; the default is `True`.
+
+Two rules do **not** bend to that flag: a pinned lane whose sidecar reports **no** model is
+`needs_review` (the pin cannot be shown to hold, and this is checked *before* the escape), and a
+lane with **no** pin has nothing to contradict, so whatever it reports is recorded as-is.
+
+The **harness** is not a parking rule at all. oprun chooses the binary from the registry, so a
+worker's opinion about which CLI it is carries no information: a `droid` lane whose sidecar
+self-reported `cursor-agent` was accepted on its real evidence, with the disagreement recorded as an
+`identity_warning`. The registry is authoritative.
