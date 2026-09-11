@@ -17,9 +17,8 @@ That is what separates a lane that can be accepted from a run that merely looks 
 
 | Unit of work | Default harness (registry id) | Why |
 |---|---|---|
-| Large multi-file refactor | `claude` | strongest long-context editing — **needs `--model`** |
 | Bounded one-slice patch + its tests | `codex` | `exec --json` returns `turn.completed`; `-s workspace-write` lets it edit |
-| Heavy / batched authoring across many files | `cursor-agent` | `-p --yolo --trust`; auto-routes its own model |
+| Large multi-file refactor; heavy / batched authoring | `cursor-agent` | `-p --yolo --trust`; longest-context editing; auto-routes its own model |
 | Light implementation + tests, Hermes-native tools | `hermes` | exit code + session id; needs `HOME=/home/logani` |
 | Long looped work driven by a brief | `pi` | `-p`; absolute binary path, not on `PATH` |
 | Repo recon / mapping (cheap re-runs) | `opencode` | see the warning below |
@@ -27,21 +26,21 @@ That is what separates a lane that can be accepted from a run that merely looks 
 | Decompose, route, inspect evidence, talk to the user | **the conductor** | never implements; holds no product edits |
 | Architecture / PASS–FAIL judgement | a *different* family than the author | not a writer |
 
-Two rules that are not yours to override, because the registry measures them:
+One rule that is not yours to override, because the registry measures it:
 
-1. **`claude` is not routable without an explicit `--model`.** Its default model 403s on this box,
-   so `routable("claude")` is `False` and `oprun dispatch --harness claude` is refused at dispatch
-   time rather than launched to fail. Supply the pin and it becomes routable.
-   Also: `subtype:"success"` was measured *alongside* `is_error:true` and exit 1 — never accept
-   this harness on `subtype`.
-2. **`opencode` cannot be trusted to report completion.** It is known to drop its terminal event
+1. **`opencode` cannot be trusted to report completion.** It is known to drop its terminal event
    (`step_finish`; issues #26855 and #31435), so `witness_strength` is `"none"`: a run can finish
    correctly and still look unfinished. Route it only where a re-run is cheap, and accept it on
    the OS exit code plus a sidecar artifact — never on its stdout alone.
 
+**`subtype` alone is never success.** A result event carrying `subtype:"success"` was measured
+*alongside* `is_error:true` and exit 1, which is why every harness that emits a result event
+(`cursor-agent`, `droid`, `pi`) is parsed on the exit code and `is_error` agreeing — never on
+`subtype`.
+
 ## Accepted spellings
 
-`cursor` → `cursor-agent` and `claude-code` → `claude`. The ledger always records the **canonical**
+`cursor` → `cursor-agent`. The ledger always records the **canonical**
 registry id, so two spellings of one CLI can never split a harness's identity. Any other id is a
 hard error that names the known ids.
 
