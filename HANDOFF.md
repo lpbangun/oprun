@@ -44,12 +44,19 @@ Its worker set was also frozen to Pi/Hermes while real runs used Cursor.
 
 ## First steps for this session
 
-1. Read `docs/PROPOSAL-v0.2.md` end to end. It is the contract; if you disagree, say so before coding.
-2. Re-verify the environment assumptions in §8 and §4 still hold on this box.
-3. Start with the smallest load-bearing piece: **`scripts/ledger.py` + `tests/test_ledger.py`.**
-   A working reference with 10/10 green tests is at `/tmp/canary3/oprun_ledger.py` — port and harden it.
-4. Then `scripts/probe.py` (the witness), `launch.py` (`systemd-run` wrapper), `harnesses.py`,
-   the CLI, and **`SKILL.md` last** (it documents what actually works).
+1. Read, in this order: `docs/BENCHMARK-v0.2.md` (the frozen gate — **do not edit it**),
+   `docs/PROPOSAL-v0.2.md` (the contract), `docs/WORKER-SET-v0.2.md` (who does what, on which model).
+2. Re-verify the environment assumptions in §8 of the proposal and §4 of the benchmark still hold.
+3. Start with the smallest load-bearing piece: **`scripts/ledger.py` + `tests/test_ledger.py`** (Phase 1,
+   deliberately serialised — everything imports it). A working reference with 10/10 green tests is at
+   `/tmp/canary3/oprun_ledger.py`; the parallel-safe version with `flock` is at `/tmp/oprun5/oprun_ledger.py`.
+   **Port and harden — do not reinvent.**
+4. Then `scripts/probe.py` (the witness), `advance.py` + `launch.py`, `harnesses.py`, the CLI, and
+   **`SKILL.md` last** (it documents what actually works).
+5. Ship gate: **`SCORE >= 9.0` AND `K=1` AND `FLOOR=17/17`** per the frozen benchmark. Unit tests alone
+   score ~2.5 — the score is in the live, detached, two-vendor runs.
+6. Layout is **repo root**: `scripts/`, `tests/`, `references/`, `templates/` beside the existing
+   `scripts/dispatch.py`. **Do not create a nested `oprun/` directory.**
 
 ## Constraints
 
