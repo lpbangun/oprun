@@ -1,7 +1,7 @@
 ---
 name: oprun
 description: Use when a long-horizon software mission runs via oprun.
-version: 0.2.0
+version: 0.2.1
 author: Logani Bangun (lpbangun), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -137,12 +137,24 @@ systemd-run --user --unit oprun-advance --collect -- \
   lanes that either finish or park.
 - **`--amend` before a push is fine; a force-push is not.** Rewriting *published* history needs the
   `destructive` grant.
+- **Verifying that a command exited, not what it recorded.** A green run says nothing about the fields
+  it wrote. Assert the semantic property — e.g. that `evidence.commit` identifies *this* lane's work
+  and is **not** the base SHA. A suite that only checked "the runner exited 0" passed 12/12 over a
+  ledger field that was false, and a reviewer zeroed the whole build for it.
+- **Assuming a fix reached every call site.** When a helper exists twice, the fix lands in one copy and
+  the other keeps the bug — especially when the stale copy lives in a module that never imports the
+  fixed one. `grep` the **function name**, not just its call sites.
+- **`git add -A` on a lane's worktree.** `.oprun/` sidecars and `__pycache__/` are lane evidence, not
+  product. Stage explicit paths when integrating a lane's work, or the sidecar dir ships.
 
 ## Verification
 
 - [ ] This session did not implement product code.
 - [ ] No daemon, no scheduler, no kanban, no PTY/Herdr lane, no model in `probe`/`settle`/`advance`.
 - [ ] Every acceptance came from `probe`/`advance` evidence, with the controller's own test re-run.
+- [ ] **Evidence fields were asserted, not just the exit code** — in particular no lane's `commit` is
+      the base SHA, and uncommitted lanes carry content hashes instead.
 - [ ] No test or check was weakened to go green.
 - [ ] Every git side effect stayed inside the recorded envelope; refusals named the missing grant.
+- [ ] Integration staged explicit paths; no `.oprun/` or `__pycache__/` in the product tree.
 - [ ] `status` ends at `nextAction: none` with zero live owned units.
