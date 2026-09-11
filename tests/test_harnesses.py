@@ -269,3 +269,37 @@ class TestCanonicalResolution:
         assert set(HARNESS_ALIASES) >= {"cursor", "claude-code", "openai-codex"}
         for alias, harness_id in HARNESS_ALIASES.items():
             assert harness_id in HARNESSES, alias
+
+
+class TestPinVerifiability:
+    """Whether a supplied pin can be *corroborated* from the harness's own output.
+
+    A different property from ``model_flag`` (the pin reaching the CLI): where the pin arrives but
+    nothing coming back names the model that ran, a reported mismatch cannot distinguish a
+    substitution from the agent guessing at its own name, so the acceptance paths make it advisory
+    (``tests/test_identity.py`` holds those cases). Only a measured harness may be marked unverifiable.
+    """
+
+    def test_the_default_is_the_strict_reading(self):
+        assert Harness.__dataclass_fields__["pin_verifiable"].default is True
+
+    def test_every_entry_sets_it_and_only_codex_was_measured_unverifiable(self):
+        assert get("codex").pin_verifiable is False
+        for harness_id in CANONICAL_IDS:
+            if harness_id != "codex":
+                assert get(harness_id).pin_verifiable is True, harness_id
+
+    def test_codex_notes_carry_the_command_and_the_observed_output(self):
+        notes = get("codex").notes
+        assert "pin_verifiable=False" in notes
+        assert "codex exec --json" in notes, "the measurement command must stay reproducible"
+        assert "--model gpt-5.6-sol" in notes
+        assert "no event carries a model id" in notes.lower()
+        assert "gpt-5.6-terra" in notes, "the observed self-report is what makes the point"
+
+    def test_unverifiable_does_not_change_how_the_pin_is_passed(self):
+        # The property governs the READING of a report, never the argv: a pin is handed to every
+        # harness exactly as before, or an unmeasured 'fix' would start silently dropping pins.
+        for harness_id in CANONICAL_IDS:
+            argv = argv_for(harness_id, model_pin="some-model-1")
+            assert argv[argv.index("--model") + 1] == "some-model-1", harness_id
