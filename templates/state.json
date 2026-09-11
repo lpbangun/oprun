@@ -1,20 +1,38 @@
 {
+  "schema_version": 1,
   "mission": "",
-  "status": "intake",
-  "conductor": {
-    "session": "",
-    "pid": null,
-    "provider": "",
-    "model": "",
-    "soleOwner": true
-  },
+  "repo": "/absolute/path/to/the/mission/repo",
+  "created_at": "2026-09-11T20:03:03Z",
+  "max_parallel": 4,
+  "failure_limit": 3,
   "approvals": {
-    "merge": false,
-    "push": false,
-    "publish": false,
-    "destructive": false
+    "commit": {"granted": true, "at": "2026-09-11T20:03:03Z", "by": "user", "scope": "mission"},
+    "push": {"granted": true, "at": "2026-09-11T20:03:03Z", "by": "user", "scope": "mission"},
+    "merge": {"granted": true, "at": "2026-09-11T20:03:03Z", "by": "user", "scope": "mission"},
+    "deploy": {"granted": false},
+    "publish": {"granted": false},
+    "destructive": {"granted": false}
   },
-  "lanes": {},
-  "routeLog": [],
-  "nextAction": ""
+  "lanes": {
+    "example-lane": {
+      "status": "dispatched",
+      "harness": "cursor-agent",
+      "worktree": "/absolute/path/to/the/lane/worktree",
+      "test_cmd": ["python3", "-m", "pytest", "tests/test_example.py", "-q"],
+      "model_requested": "cursor-grok-4.6",
+      "depends_on": [],
+      "parent_dispatch": null,
+      "depth": 0,
+      "dispatch_id": "example-lane-d1",
+      "attempt": 1,
+      "consecutive_failures": 0,
+      "accepted": [],
+      "rejected": [],
+      "evidence": {},
+      "history": [{"event": "dispatch", "from": "pending", "to": "dispatched", "at": 1783044000.0}]
+    }
+  },
+  "approval_history": [
+    {"at": "2026-09-11T20:03:03Z", "by": "user", "grant": ["commit", "push", "merge"], "revoke": []}
+  ]
 }
