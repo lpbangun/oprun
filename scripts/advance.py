@@ -45,7 +45,6 @@ refuses; the ledger, the sidecar and systemd each answer a different question.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import subprocess
 import sys
@@ -54,7 +53,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-from ledger import TERMINAL, Ledger
+# The ONE git-evidence builder lives in the ledger, next to the lane records whose ``base_commit``
+# anchor it needs: this module used to carry its own copy, and that copy named the worktree's HEAD
+# (the shared base SHA, for a lane that never committed) as the lane's ``commit``.
+from ledger import TERMINAL, Ledger, git_evidence
 
 import launch  # sibling module: the only detach/lifetime authority (scripts/launch.py)
 # The identity rule — did this lane run the model and harness the ledger designated? — lives with
@@ -88,10 +90,6 @@ SIDECAR_SUFFIX = ".json"
 TEST_TIMEOUT = 300.0
 #: Characters of test output kept as evidence (the tail is where failures are named).
 TEST_TAIL = 2000
-#: Files hashed for the uncommitted-work evidence path, so one huge lane cannot bloat the ledger.
-HASH_LIMIT = 50
-
-_GIT_TIMEOUT = 30.0
 
 #: Verdicts a lane can carry, matching ``probe``'s vocabulary.
 DONE, PENDING, NEEDS_INPUT, STALLED, FAILED_VERDICT = (
@@ -356,63 +354,6 @@ def _run_test(lane: dict, worktree: Path, deadline: float) -> tuple[int, str, st
     return proc.returncode, tail, f"exited {proc.returncode}"
 
 
-def _hash_path(base: Path, rel: str) -> str | None:
-    """A content hash for one changed path: the file's sha256, or a digest of a whole directory.
-
-    An untracked directory (``.oprun/`` and friends) is part of what a lane produced, so it is
-    digested rather than reported as unknown; a path that is gone (deleted/renamed away) is
-    honestly ``None``.
-    """
-    target = base / rel
-    try:
-        if target.is_file():
-            return hashlib.sha256(target.read_bytes()).hexdigest()
-        if target.is_dir():
-            digest = hashlib.sha256()
-            files = sorted(path for path in target.rglob("*") if path.is_file())
-            for path in files[:HASH_LIMIT]:
-                digest.update(str(path.relative_to(base)).encode("utf-8"))
-                digest.update(hashlib.sha256(path.read_bytes()).digest())
-            return f"dir:{digest.hexdigest()}:{len(files)}files"
-        return None
-    except OSError:
-        return None
-
-
-def _git_evidence(worktree: Path) -> dict:
-    """``commit`` / ``uncommitted`` / ``hashes`` for the lane's worktree.
-
-    A lane that did not commit gets ``uncommitted=True`` plus content hashes of its changed
-    files — never the shared base SHA dressed up as the lane's work (the defect that made three
-    parallel lanes' evidence indistinguishable). Unavailable git is recorded, not guessed.
-    """
-    def git(*args: str, strip: bool = True) -> tuple[int, str]:
-        try:
-            proc = subprocess.run(["git", "-C", str(worktree), *args], capture_output=True,
-                                  text=True, timeout=_GIT_TIMEOUT)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return 128, str(exc)
-        out = proc.stdout or ""
-        # Porcelain output must NOT be stripped as a whole: the first line of `status --porcelain`
-        # begins with a space for worktree-only changes (" M work.txt"), and a blanket strip turns
-        # the path into "ork.txt" — silently hashing a file that does not exist.
-        return proc.returncode, out.strip() if strip else out
-
-    rc, head = git("rev-parse", "HEAD")
-    if rc != 0 or not head:
-        return {"commit": None, "uncommitted": None, "hashes": {},
-                "git_error": head or f"git rev-parse exited {rc}"}
-    # Porcelain paths are relative to the REPOSITORY ROOT, not to `-C`, so the root is asked
-    # for explicitly: a lane worktree is normally the root, but a lane pointed at a subdirectory
-    # must not silently hash the wrong files.
-    rc_root, root = git("rev-parse", "--show-toplevel")
-    base = Path(root) if rc_root == 0 and root else worktree
-    rc_status, status = git("status", "--porcelain", strip=False)
-    changed = [line[3:].strip().split(" -> ")[-1] for line in status.splitlines() if line.strip()]
-    hashes = {rel: _hash_path(base, rel) for rel in changed[:HASH_LIMIT]}
-    return {"commit": head, "uncommitted": bool(changed), "hashes": hashes}
-
-
 def _utc_now() -> str:
     """ISO-8601 UTC, second precision."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -548,7 +489,10 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         "worktree": str(worktree),
         "witness": witness,
         "checked_at": _utc_now(),
-        **_git_evidence(worktree),
+        # The ONE builder, from the ledger: the lane's own commit or nothing — never the commit the
+        # lane started from (which is what this path used to record, name and all, for a lane with
+        # uncommitted work).
+        **git_evidence(worktree, lane.get("base_commit")),
     }
     result = led.settle(lane_id, dispatch_id, True, evidence=evidence,
                         reason="accepted on evidence: valid sidecar + controller test exit 0")

@@ -37,7 +37,6 @@ never asks systemd whether a lane is *done*, and nothing here invokes a model.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shlex
@@ -68,6 +67,7 @@ from ledger import (  # noqa: E402  (sibling: the only lane-status authority)
     IllegalTransition,
     Ledger,
     ParallelismExceeded,
+    git_evidence,
 )
 
 # --- frozen vocabulary -------------------------------------------------------
@@ -115,7 +115,6 @@ GIT_TIMEOUT = 120.0
 TEST_TIMEOUT = 900.0
 #: Characters of a test/git output tail kept in evidence.
 TAIL_CHARS = 400
-HASH_LIMIT = 50
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = REPO_ROOT / "templates"
@@ -389,51 +388,6 @@ def _git_common_root(worktree: Path) -> Path | None:
     if not common.is_absolute():
         common = (worktree / common)
     return common.resolve().parent
-
-
-def _content_hashes(worktree: Path, base: Path, count: int = HASH_LIMIT) -> dict[str, str | None]:
-    """sha256 per changed path, so uncommitted work is identifiable without a commit.
-
-    Never a base SHA dressed up as the lane's work (the v0.2 evidence defect).
-    """
-    rc, status, _ = _git(worktree, "status", "--porcelain")
-    if rc != 0:
-        return {}
-    changed = [line[3:].strip().split(" -> ")[-1] for line in status.splitlines() if line.strip()]
-    hashes: dict[str, str | None] = {}
-    for rel in changed[:count]:
-        target = base / rel
-        try:
-            if target.is_file():
-                hashes[rel] = hashlib.sha256(target.read_bytes()).hexdigest()
-            elif target.is_dir():
-                digest = hashlib.sha256()
-                files = sorted(path for path in target.rglob("*") if path.is_file())
-                for path in files[:count]:
-                    digest.update(str(path.relative_to(base)).encode("utf-8"))
-                    digest.update(hashlib.sha256(path.read_bytes()).digest())
-                hashes[rel] = f"dir:{digest.hexdigest()}:{len(files)}files"
-            else:
-                hashes[rel] = None
-        except OSError:
-            hashes[rel] = None
-    return hashes
-
-
-def _git_evidence(worktree: Path) -> dict:
-    """``branch`` / ``uncommitted`` / ``hashes`` for the lane's worktree. No commit is implied."""
-    rc, root_out, _ = _git(worktree, "rev-parse", "--show-toplevel")
-    base = Path(root_out.strip()) if rc == 0 and root_out.strip() else worktree
-    rc_status, status, _ = _git(worktree, "status", "--porcelain")
-    changed = bool(status.strip()) if rc_status == 0 else None
-    evidence = {
-        "branch": _current_branch(worktree),
-        "uncommitted": changed,
-        "hashes": _content_hashes(worktree, base) if changed else {},
-    }
-    if rc_status != 0:
-        evidence["git_error"] = "git status failed in the lane worktree"
-    return evidence
 
 
 # --- git side effects (performed ONLY inside the envelope) -------------------
@@ -951,7 +905,9 @@ def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
         "checked_at": _utc_now(),
         **_identity_fields(lane, worktree, dispatch_id, document),
         "identity_warning": warning,
-        **_git_evidence(worktree),
+        # The one shared builder: `commit` is the lane's own commit or None, never the commit the
+        # lane was cut from.
+        **git_evidence(worktree, lane.get("base_commit")),
     }
     result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=args.needs_review)
     if not result.get("accepted"):
@@ -984,7 +940,7 @@ def _settle_refused(args: argparse.Namespace, led: Ledger, dispatch_id: str, wor
         "checked_at": _utc_now(),
         **identity,
         "identity_warning": identity_warning,
-        **_git_evidence(worktree),
+        **git_evidence(worktree, led.lane(args.lane).get("base_commit")),
     }
     result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=reason)
     if not result.get("accepted"):
@@ -1118,7 +1074,10 @@ def cmd_settle(args: argparse.Namespace) -> int:
             failures.append(f"delete-branch: {delete_info.get('detail')}")
 
     # 6. Evidence: the SHAs actually produced, the identity actually observed, and nothing invented.
-    git_info = _git_evidence(worktree)
+    #    ``git_info`` comes from the ONE shared builder, anchored on the lane's starting commit: it
+    #    names a commit only when HEAD has moved off that anchor (the lane committed its own work)
+    #    and there is no uncommitted work left to describe. Never the base SHA.
+    git_info = git_evidence(worktree, lane.get("base_commit"))
     evidence = {
         "controller": "oprun-settle",
         "dispatch_id": str(dispatch_id),
@@ -1134,7 +1093,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
         # Advisory only, on the accepted path too: an accepted lane can still carry a disagreeing
         # harness self-report, and the reviewer should not have to open the sidecar to find out.
         "identity_warning": warning,
-        "commit": (commit_info or {}).get("sha") or None,
+        "commit": (commit_info or {}).get("sha") or git_info.get("commit") or None,
         "uncommitted": git_info.get("uncommitted"),
         "hashes": git_info.get("hashes") or {},
         "push": push_info,
