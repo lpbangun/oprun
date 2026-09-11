@@ -6,6 +6,7 @@ not prose: if a note stops carrying a fact a controller relies on, that is a fai
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -19,8 +20,10 @@ import pytest  # noqa: E402
 from harnesses import (  # noqa: E402
     CANONICAL_IDS,
     HARNESSES,
+    HARNESS_ALIASES,
     Harness,
     argv_for,
+    canonical_id,
     get,
     model_pin_required,
     routable,
@@ -195,3 +198,74 @@ class TestRecipes:
     def test_argv_for_refuses_an_unpinned_claude(self):
         with pytest.raises(KeyError):
             argv_for("claude")
+
+
+class TestTheModelPinReachesTheCommandLine:
+    """A pin the CLI never received is a pin the ledger asserted and the lane never applied.
+
+    The measured defect: the flag was appended only for a harness with ``requires_model_pin`` —
+    ``claude`` — so an operator's ``--model`` was silently dropped for every other harness while
+    ``model_requested`` was still recorded. That is a silent substitution, produced by this module.
+    """
+
+    def test_a_supplied_pin_is_passed_for_every_harness(self):
+        for harness_id in CANONICAL_IDS:
+            argv = argv_for(harness_id, model_pin="some-model-1")
+            assert "--model" in argv, harness_id
+            assert argv[argv.index("--model") + 1] == "some-model-1", harness_id
+
+    def test_the_codex_pin_is_passed_ahead_of_the_brief(self):
+        assert argv_for("codex", model_pin="gpt-5.6-sol", extra=("BRIEF",)) == (
+            "codex", "exec", "--json", "-s", "workspace-write",
+            "--model", "gpt-5.6-sol", "BRIEF",
+        )
+
+    def test_pinning_never_rewrites_the_unattended_recipe(self):
+        recipe = get("cursor-agent").unattended_argv
+        argv = argv_for("cursor-agent", model_pin="cursor-grok-4.6")
+        assert argv[:1 + len(recipe)] == ("cursor-agent", *recipe)
+        assert argv[1 + len(recipe):] == ("--model", "cursor-grok-4.6")
+
+    def test_a_blank_pin_counts_as_no_pin_and_is_not_passed(self):
+        # routable()'s own convention, kept: a blank pin is not a pin, so nothing is claimed.
+        assert "--model" not in argv_for("codex", model_pin="   ")
+        assert "--model" not in argv_for("codex", model_pin="")
+        assert argv_for("codex", model_pin=None) == ("codex", *get("codex").unattended_argv)
+
+    def test_requires_model_pin_still_means_only_claude_cannot_run_unpinned(self):
+        for harness_id in CANONICAL_IDS:
+            assert model_pin_required(harness_id) is (harness_id == "claude"), harness_id
+
+    def test_every_entry_names_the_flag_that_carries_a_pin(self):
+        for harness in HARNESSES.values():
+            assert harness.model_flag == "--model", harness.id
+
+    def test_a_harness_with_no_model_flag_refuses_the_pin_rather_than_dropping_it(
+            self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setitem(HARNESSES, "codex",
+                            dataclasses.replace(HARNESSES["codex"], model_flag=""))
+        with pytest.raises(KeyError) as excinfo:
+            argv_for("codex", model_pin="gpt-5.6-sol")
+        assert "gpt-5.6-sol" in str(excinfo.value), "the refusal must name the pin it refused"
+
+
+class TestCanonicalResolution:
+    """One table for harness identity: an accepted spelling resolves, anything else is loud."""
+
+    def test_accepted_spellings_resolve_to_the_registry_id(self):
+        assert canonical_id("cursor") == "cursor-agent"
+        assert canonical_id("claude-code") == "claude"
+        assert canonical_id("openai-codex") == "codex"
+
+    def test_a_registry_id_resolves_to_itself(self):
+        for harness_id in CANONICAL_IDS:
+            assert canonical_id(harness_id) == harness_id
+
+    def test_an_unknown_id_is_a_hard_error(self):
+        with pytest.raises(KeyError):
+            canonical_id("not-a-harness")
+
+    def test_the_alias_table_is_the_registrys_and_maps_only_to_real_ids(self):
+        assert set(HARNESS_ALIASES) >= {"cursor", "claude-code", "openai-codex"}
+        for alias, harness_id in HARNESS_ALIASES.items():
+            assert harness_id in HARNESSES, alias

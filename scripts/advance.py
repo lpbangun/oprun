@@ -14,12 +14,17 @@ Three rules are load-bearing:
    matches the lane's CURRENT ``dispatch_id``, reports ``status == "success"``, *and* the
    controller re-runs the lane's own ``test_cmd`` to exit 0. Nothing else can accept a lane. A
    dead unit with a valid sidecar is done; a live unit with no sidecar is not.
-2. **A unit's lifetime answers "should I keep waiting?" — never "is it done?"** (see
+2. **A substitution is never accepted.** The sidecar's ``harness``/``model`` are compared against
+   the lane's registry id and its requested pin (``identity_reason``, imported from the registry —
+   the same function the CLI's ``settle`` calls): a normalized model mismatch, a harness that is not
+   the registered one, or a pin that was never reported all PARK the lane. Both raw strings are kept
+   in the settled evidence, so "the requested model actually ran" is checkable after the fact.
+3. **A unit's lifetime answers "should I keep waiting?" — never "is it done?"** (see
    :func:`_unit_lifetime`). At the deadline it decides exactly one thing: whether a *missing*
    sidecar is still possible. A still-active unit is left alone (the worker may be about to write
    its evidence); a finished-or-absent one makes the silence final, so the dispatch is settled as
    a **failure**. Lifetime can never accept a lane — acceptance is evidence only.
-3. **Every loop is bounded.** The runner returns when the lanes are decided or when the deadline
+4. **Every loop is bounded.** The runner returns when the lanes are decided or when the deadline
    passes. A lane that fails is *parked*, not retried blindly: the ledger's circuit breaker owns
    the failure streak, and a ``blocked`` lane is terminal as far as this process is concerned.
 
@@ -48,6 +53,13 @@ from typing import Callable, NamedTuple
 from ledger import TERMINAL, Ledger
 
 import launch  # sibling module: the only detach/lifetime authority (scripts/launch.py)
+# The identity rule — did this lane run the model and harness the ledger designated? — lives with
+# the registry that owns the harness ids and their accepted spellings, and the CLI's ``settle``
+# imports the same function. One rule, two acceptance paths: the runner can never disagree with the
+# CLI about a substitution. The import is deliberately NOT optional — a guarantee that can silently
+# be absent is not a guarantee — and it stays a leaf import (``harnesses`` imports nothing but the
+# ledger), so ``advance`` still runs with or without ``probe.py``.
+from harnesses import identity_reason  # sibling module: the registry's identity rule
 
 try:  # scripts/probe.py is written by a sibling lane; advance must not require it
     from probe import probe as _probe_lane  # type: ignore[import-not-found]
@@ -224,6 +236,16 @@ def lane_verdict(lane: dict, *, lane_id: str = "", unit_active: bool | None = No
     if why:
         return {"verdict": FAILED_VERDICT, "reason": why, "case": "unusable_artifact",
                 "evidence": found}
+    # The artifact is well-formed and claims success — now check it claims the RIGHT run: the model
+    # the lane asked for and the harness it was registered under. A substitution (or a pin that was
+    # never reported) is a failed dispatch, so it parks and is never accepted.
+    identity = identity_reason(harness=lane.get("harness"),
+                               model_requested=lane.get("model_requested"),
+                               harness_reported=payload.get("harness"),
+                               model_reported=payload.get("model"))
+    if identity:
+        return {"verdict": FAILED_VERDICT, "reason": identity, "case": "unusable_artifact",
+                "evidence": found}
     return {"verdict": DONE, "reason": f"{path.name} matches dispatch {dispatch_id!r}",
             "case": "ok", "evidence": found}
 
@@ -396,12 +418,20 @@ def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, rea
                  emit: Callable[[str], None], *, verdict: dict | None = None,
                  witness: dict | None = None, exit_code: int | None = None) -> _Decision:
     """Refuse an outcome: the lane goes to ``needs_review`` — and never to ``completed``."""
+    lane = led.lane(lane_id)
+    facts = ((verdict or {}).get("evidence") or {}).get("facts") or {}
     evidence = {
         "controller": "advance",
         "dispatch_id": dispatch_id,
         "verdict": (verdict or {}).get("verdict"),
         "rejected_because": reason,
         "sidecar": (verdict or {}).get("evidence", {}).get("sidecar"),
+        # The registered identity, and what the worker reported — kept verbatim even on a park, so
+        # the pair a human reviews is the pair that was actually observed.
+        "harness": lane.get("harness"),
+        "harness_reported": facts.get("harness"),
+        "model_requested": lane.get("model_requested"),
+        "model_reported": facts.get("model"),
         "test_exit_code": exit_code,
         "witness": witness,
         "checked_at": _utc_now(),
@@ -483,7 +513,9 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         "sidecar": verdict["evidence"]["sidecar"],
         "sidecar_facts": verdict["evidence"].get("facts"),
         "harness": lane.get("harness"),
+        "harness_reported": (verdict["evidence"].get("facts") or {}).get("harness"),
         "model_requested": lane.get("model_requested"),
+        "model_reported": (verdict["evidence"].get("facts") or {}).get("model"),
         "test_cmd": [str(part) for part in (lane.get("test_cmd") or [])],
         "test_exit_code": exit_code,
         "test_result": "pass",

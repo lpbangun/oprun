@@ -11,14 +11,18 @@ model anywhere in the completion path::
     oprun status [--json]
     oprun approve --grant commit,push | --revoke push
 
-This module owns exactly three things and delegates the rest:
+This module owns exactly four things and delegates the rest:
 
 * **argument parsing + exit codes** — one entrypoint, no traceback dumps;
 * **the approval envelope** — decided once at ``init``, recorded in the ledger, printed by
   ``status``, and *never widened implicitly*; risky git actions (force-push, tag, release,
   history rewrite, branch delete, another repo) each need their own grant;
 * **the git side effects a granted envelope authorises** — commit / push / merge performed
-  by ``settle --accept`` with no prompt.
+  by ``settle --accept`` with no prompt;
+* **the identity rule** — the model and harness a lane must be running, compared against what
+  its worker reported (``settle`` calls ``harnesses.identity_reason``). A substitution parks the
+  lane and is never recorded as ``completed``; ``scripts/advance.py`` calls the same function, so
+  the runner and the CLI can never disagree about it.
 
 It does not own lane status (``scripts/ledger.py``), process lifetime (``scripts/launch.py``)
 or completion (``scripts/probe.py``). ``init`` and ``dispatch`` never settle a lane, ``probe``
@@ -80,8 +84,10 @@ SIDECAR_DIRNAME = ".oprun"
 SIDECAR_TEMPLATE = "result.{dispatch_id}.json"
 
 #: Accepted spellings that unambiguously mean one registry id. The *ledger* always records the
-#: canonical id, so two spellings can never split a harness's identity.
-HARNESS_ALIASES = {"cursor": "cursor-agent", "claude-code": "claude"}
+#: canonical id, so two spellings can never split a harness's identity. The table itself lives with
+#: the ids it maps to (:data:`harnesses.HARNESS_ALIASES`) and is re-exported here, because the CLI
+#: is where an operator reads the accepted spellings — there is exactly one table for identity.
+HARNESS_ALIASES = harnesses.HARNESS_ALIASES
 
 #: Default profile for a harness whose recipe needs ``<profile>`` (hermes).
 DEFAULT_PROFILE = "coder"
@@ -573,11 +579,17 @@ Write this result file atomically (temp file, then rename) when you stop: {{side
 """
 
 
+def sidecar_path(worktree: Path, dispatch_id: str) -> Path:
+    """``<worktree>/.oprun/result.<dispatch_id>.json`` — one artifact per dispatch, no sharing."""
+    return (Path(worktree) / SIDECAR_DIRNAME
+            / SIDECAR_TEMPLATE.format(dispatch_id=dispatch_id))
+
+
 def render_worker_brief(*, lane: str, dispatch_id: str, worktree: Path, test_cmd: list[str],
                         task: str) -> str:
     """The injectable worker preamble plus the task, with this dispatch's sidecar path filled in."""
     template = _read_template("worker-brief.md") or DEFAULT_WORKER_PREAMBLE
-    sidecar = Path(worktree) / SIDECAR_DIRNAME / SIDECAR_TEMPLATE.format(dispatch_id=dispatch_id)
+    sidecar = sidecar_path(worktree, dispatch_id)
     substitutions = {
         "{{lane}}": lane,
         "{{dispatch_id}}": dispatch_id,
@@ -592,10 +604,12 @@ def render_worker_brief(*, lane: str, dispatch_id: str, worktree: Path, test_cmd
 
 
 def canonical_harness(harness_id: str) -> str:
-    """The registry id for ``harness_id``: aliases resolve, unknown ids are a hard error."""
-    canonical = HARNESS_ALIASES.get(harness_id, harness_id)
-    harnesses.get(canonical)  # raises KeyError for an unknown id: never a silent fallback
-    return canonical
+    """The registry id for ``harness_id``: aliases resolve, unknown ids are a hard error.
+
+    Delegates to the registry, so dispatch, ``settle`` and ``advance`` resolve a spelling the same
+    way and two spellings of one CLI can never be routed (or compared) as two harnesses.
+    """
+    return harnesses.canonical_id(harness_id)
 
 
 def build_worker_argv(harness_id: str, *, model: str | None, brief_path: Path,
@@ -624,6 +638,51 @@ def _resolve_binary(binary: str) -> str | None:
     if Path(binary).is_absolute():
         return binary if Path(binary).is_file() else None
     return shutil.which(binary)
+
+
+# --- identity: the designation vs what the worker reported -------------------
+def _current_sidecar(worktree: Path, dispatch_id: str) -> tuple[dict | None, str]:
+    """The lane's sidecar for its CURRENT dispatch: ``(document, problem)``.
+
+    ``(None, "")`` — there is no sidecar at all, so no identity was reported and there is nothing
+    to contradict. The check never invents a claim on the worker's behalf: whether an
+    artifact-less lane may be accepted at all is decided by the controller's own re-run of
+    ``test_cmd``, elsewhere.
+
+    ``(None, why)`` — a file exists at the exact path but is not a readable JSON object. That is
+    an *unusable* artifact, not an absent one, and an unusable artifact is never accepted.
+
+    ``(document, "")`` — the reported identity, verbatim.
+    """
+    path = sidecar_path(worktree, dispatch_id)
+    if not path.is_file():
+        return None, ""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"sidecar {path} is unreadable: {exc}"
+    if not isinstance(document, dict):
+        return None, f"sidecar {path} is not a JSON object"
+    return document, ""
+
+
+def _identity_fields(lane: dict, worktree: Path, dispatch_id: str,
+                     document: dict | None) -> dict:
+    """The identity pair for the settled evidence, verbatim and audit-ready.
+
+    ``harness`` is the lane's REGISTRY id and the sidecar's spelling lands only in
+    ``harness_reported``: a lane's harness comes from the registry, never from the worker. Both
+    raw model strings are kept whichever way the check went — that pair is what makes "the pin was
+    actually applied" checkable after the fact.
+    """
+    reported = document or {}
+    return {
+        "sidecar": str(sidecar_path(worktree, dispatch_id)),
+        "harness": lane.get("harness"),
+        "harness_reported": reported.get("harness"),
+        "model_requested": lane.get("model_requested"),
+        "model_reported": reported.get("model"),
+    }
 
 
 # --- verbs: init -------------------------------------------------------------
@@ -869,6 +928,7 @@ def _planned_actions(worktree: Path, branch: str | None) -> list[str]:
 def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
                          dispatch_id: str, worktree: Path) -> int:
     """Park the lane for a human. Records evidence; **performs no git mutation at all**."""
+    document, _problem = _current_sidecar(worktree, dispatch_id)
     evidence = {
         "controller": "oprun-settle",
         "dispatch_id": dispatch_id,
@@ -877,6 +937,7 @@ def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
         "worktree": str(worktree),
         "test_result": "not_run",
         "checked_at": _utc_now(),
+        **_identity_fields(lane, worktree, dispatch_id, document),
         **_git_evidence(worktree),
     }
     result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=args.needs_review)
@@ -885,6 +946,36 @@ def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
     print(f"oprun settle: lane {args.lane!r} -> {result['status']} (needs_review)")
     print(f"  reason: {args.needs_review}")
     return EXIT_OK
+
+
+def _settle_refused(args: argparse.Namespace, led: Ledger, dispatch_id: str, worktree: Path,
+                    reason: str, identity: dict) -> int:
+    """Park a lane the controller REFUSED to accept. **Performs no git mutation at all.**
+
+    A refused ``--accept`` is a settlement, not a state the operator has to fix by hand: the
+    reason is recorded on the lane, the lane can never be read as ``completed`` (there is no
+    ``success`` in its history), and the CLI still exits non-zero so a scripted caller cannot
+    mistake the refusal for an acceptance.
+    """
+    evidence = {
+        "controller": "oprun-settle",
+        "dispatch_id": dispatch_id,
+        "verdict": "needs_review",
+        "reason": reason,
+        "worktree": str(worktree),
+        "test_result": "not_run",
+        "checked_at": _utc_now(),
+        **identity,
+        **_git_evidence(worktree),
+    }
+    result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=reason)
+    if not result.get("accepted"):
+        raise CLIError(f"ledger refused the settlement: {result.get('reason')}", EXIT_ILLEGAL)
+    print(f"oprun settle: lane {args.lane!r} -> {result['status']} (needs_review)")
+    print(f"  reason: {reason}")
+    print(f"oprun settle: refusing --accept for {args.lane!r}: the lane is parked for review",
+          file=sys.stderr)
+    return EXIT_ERROR
 
 
 def cmd_settle(args: argparse.Namespace) -> int:
@@ -916,7 +1007,23 @@ def cmd_settle(args: argparse.Namespace) -> int:
     if problems:
         raise CLIError("; ".join(problems), EXIT_REFUSED)
 
-    # 2. The controller's own re-run of the lane's test. Red test => no accept.
+    # 2. Identity: the ledger's designation vs what the worker reported. This runs before the test
+    #    re-run and before any git side effect, so a substituted lane is never committed, pushed or
+    #    merged either — and a mismatch always PARKS (needs_review), it never warns and continues.
+    document, problem = _current_sidecar(worktree, str(dispatch_id))
+    if problem:
+        return _settle_refused(args, led, str(dispatch_id), worktree, problem,
+                               _identity_fields(lane, worktree, str(dispatch_id), None))
+    if document is not None:
+        reason = harnesses.identity_reason(harness=lane.get("harness"),
+                                           model_requested=lane.get("model_requested"),
+                                           harness_reported=document.get("harness"),
+                                           model_reported=document.get("model"))
+        if reason:
+            return _settle_refused(args, led, str(dispatch_id), worktree, reason,
+                                   _identity_fields(lane, worktree, str(dispatch_id), document))
+
+    # 3. The controller's own re-run of the lane's test. Red test => no accept.
     rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree)
     if rc != 0:
         raise CLIError(
@@ -928,7 +1035,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
     branch = _current_branch(worktree)
     planned = _planned_actions(worktree, branch)
 
-    # 3. Anything the envelope does not grant is asked about exactly once, and recorded.
+    # 4. Anything the envelope does not grant is asked about exactly once, and recorded.
     missing = [action for action in planned if not is_granted(envelope, action)]
     approval_prompt = None
     if missing:
@@ -941,7 +1048,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
 
     allowed = {action for action in GIT_ACTIONS if is_granted(envelope, action)}
 
-    # 4. Git side effects, in order: commit -> push -> merge -> (tag / release).
+    # 5. Git side effects, in order: commit -> push -> merge -> (tag / release).
     commit_info: dict | None = None
     push_info: dict | None = None
     merge_info: dict | None = None
@@ -978,7 +1085,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
         if not delete_info.get("ok"):
             failures.append(f"delete-branch: {delete_info.get('detail')}")
 
-    # 5. Evidence: the SHAs actually produced, and nothing invented.
+    # 6. Evidence: the SHAs actually produced, the identity actually observed, and nothing invented.
     git_info = _git_evidence(worktree)
     evidence = {
         "controller": "oprun-settle",
@@ -991,6 +1098,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
         "test_exit_code": rc,
         "test_result": "pass",
         "test_output_tail": tail,
+        **_identity_fields(lane, worktree, str(dispatch_id), document),
         "commit": (commit_info or {}).get("sha") or None,
         "uncommitted": git_info.get("uncommitted"),
         "hashes": git_info.get("hashes") or {},
