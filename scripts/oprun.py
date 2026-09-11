@@ -20,9 +20,15 @@ This module owns exactly four things and delegates the rest:
 * **the git side effects a granted envelope authorises** — commit / push / merge performed
   by ``settle --accept`` with no prompt;
 * **the identity rule** — the model and harness a lane must be running, compared against what
-  its worker reported (``settle`` calls ``harnesses.identity_reason``). A substitution parks the
-  lane and is never recorded as ``completed``; ``scripts/advance.py`` calls the same function, so
-  the runner and the CLI can never disagree about it.
+  its worker reported (``settle`` calls ``harnesses.identity_reason``, and
+  ``harnesses.identity_warning`` for the advisory half). A **model** substitution parks the lane and
+  is never recorded as ``completed``; the one exception is a harness that declares
+  ``pin_verifiable=False``, where the pin reaches the CLI but nothing the CLI emits can corroborate
+  it, so a reported mismatch is recorded as an advisory ``identity_warning`` instead of failing
+  correct work. **Harness identity comes from the registry** — oprun picked the binary — so a
+  worker's harness self-report is recorded verbatim and warned about, never enforced.
+  ``scripts/advance.py`` calls the same two functions, so the runner and the CLI can never disagree
+  about it.
 
 It does not own lane status (``scripts/ledger.py``), process lifetime (``scripts/launch.py``)
 or completion (``scripts/probe.py``). ``init`` and ``dispatch`` never settle a lane, ``probe``
@@ -929,6 +935,12 @@ def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
                          dispatch_id: str, worktree: Path) -> int:
     """Park the lane for a human. Records evidence; **performs no git mutation at all**."""
     document, _problem = _current_sidecar(worktree, dispatch_id)
+    # Advisory only, and recorded here as well: a lane parked by hand can still be carrying a harness
+    # self-report that disagrees with the registry, which is a fact the next reader wants. A lane with
+    # no sidecar at all reported nothing, so there is nothing to advise about.
+    warning = "" if document is None else harnesses.identity_warning(
+        harness=lane.get("harness"), model_requested=lane.get("model_requested"),
+        harness_reported=document.get("harness"), model_reported=document.get("model"))
     evidence = {
         "controller": "oprun-settle",
         "dispatch_id": dispatch_id,
@@ -938,6 +950,7 @@ def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
         "test_result": "not_run",
         "checked_at": _utc_now(),
         **_identity_fields(lane, worktree, dispatch_id, document),
+        "identity_warning": warning,
         **_git_evidence(worktree),
     }
     result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=args.needs_review)
@@ -949,13 +962,17 @@ def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
 
 
 def _settle_refused(args: argparse.Namespace, led: Ledger, dispatch_id: str, worktree: Path,
-                    reason: str, identity: dict) -> int:
+                    reason: str, identity: dict, *, identity_warning: str = "") -> int:
     """Park a lane the controller REFUSED to accept. **Performs no git mutation at all.**
 
     A refused ``--accept`` is a settlement, not a state the operator has to fix by hand: the
     reason is recorded on the lane, the lane can never be read as ``completed`` (there is no
     ``success`` in its history), and the CLI still exits non-zero so a scripted caller cannot
     mistake the refusal for an acceptance.
+
+    ``identity_warning`` is the advisory half of the same comparison — a harness self-report that
+    disagrees with the registry, say — and is carried onto the park so the reviewer sees the whole
+    observation, not just the fatal part of it.
     """
     evidence = {
         "controller": "oprun-settle",
@@ -966,11 +983,14 @@ def _settle_refused(args: argparse.Namespace, led: Ledger, dispatch_id: str, wor
         "test_result": "not_run",
         "checked_at": _utc_now(),
         **identity,
+        "identity_warning": identity_warning,
         **_git_evidence(worktree),
     }
     result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=reason)
     if not result.get("accepted"):
         raise CLIError(f"ledger refused the settlement: {result.get('reason')}", EXIT_ILLEGAL)
+    if identity_warning:
+        print(f"  identity warning (advisory): {identity_warning}")
     print(f"oprun settle: lane {args.lane!r} -> {result['status']} (needs_review)")
     print(f"  reason: {reason}")
     print(f"oprun settle: refusing --accept for {args.lane!r}: the lane is parked for review",
@@ -1009,19 +1029,31 @@ def cmd_settle(args: argparse.Namespace) -> int:
 
     # 2. Identity: the ledger's designation vs what the worker reported. This runs before the test
     #    re-run and before any git side effect, so a substituted lane is never committed, pushed or
-    #    merged either — and a mismatch always PARKS (needs_review), it never warns and continues.
+    #    merged either. The MODEL is the guard and a mismatch PARKS the lane (needs_review) — with one
+    #    measured exception: on a harness that declares ``pin_verifiable=False`` (codex: the
+    #    ``exec --json`` stream carries no model id at all) the pin provably reaches the CLI but
+    #    nothing coming back can corroborate it, so a reported difference is the advisory
+    #    ``identity_warning`` instead of a false-negative park. The HARNESS is never enforced: oprun
+    #    chose the binary from the registry, so a disagreeing self-report is recorded and warned
+    #    about, nothing more.
     document, problem = _current_sidecar(worktree, str(dispatch_id))
     if problem:
         return _settle_refused(args, led, str(dispatch_id), worktree, problem,
                                _identity_fields(lane, worktree, str(dispatch_id), None))
+    warning = ""
     if document is not None:
+        warning = harnesses.identity_warning(harness=lane.get("harness"),
+                                             model_requested=lane.get("model_requested"),
+                                             harness_reported=document.get("harness"),
+                                             model_reported=document.get("model"))
         reason = harnesses.identity_reason(harness=lane.get("harness"),
                                            model_requested=lane.get("model_requested"),
                                            harness_reported=document.get("harness"),
                                            model_reported=document.get("model"))
         if reason:
             return _settle_refused(args, led, str(dispatch_id), worktree, reason,
-                                   _identity_fields(lane, worktree, str(dispatch_id), document))
+                                   _identity_fields(lane, worktree, str(dispatch_id), document),
+                                   identity_warning=warning)
 
     # 3. The controller's own re-run of the lane's test. Red test => no accept.
     rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree)
@@ -1099,6 +1131,9 @@ def cmd_settle(args: argparse.Namespace) -> int:
         "test_result": "pass",
         "test_output_tail": tail,
         **_identity_fields(lane, worktree, str(dispatch_id), document),
+        # Advisory only, on the accepted path too: an accepted lane can still carry a disagreeing
+        # harness self-report, and the reviewer should not have to open the sidecar to find out.
+        "identity_warning": warning,
         "commit": (commit_info or {}).get("sha") or None,
         "uncommitted": git_info.get("uncommitted"),
         "hashes": git_info.get("hashes") or {},
@@ -1119,6 +1154,8 @@ def cmd_settle(args: argparse.Namespace) -> int:
 
     print(f"oprun settle: lane {args.lane!r} -> {result['status']} (accepted, dispatch {dispatch_id})")
     print(f"  test:   rc={rc}")
+    if warning:
+        print(f"  identity warning (advisory): {warning}")
     if commit_info is not None:
         print(f"  commit: {commit_info.get('sha') or '(nothing to commit)'}")
     if push_info is not None:

@@ -1,11 +1,27 @@
-"""The identity rule on the ACCEPTANCE path — a substitution must never be recorded as ``completed``.
+"""The identity rule on the ACCEPTANCE path — a substituted MODEL must never be recorded as
+``completed``, and a worker's opinion about which CLI it is must never fail correct work.
 
 A unit test of ``ledger.normalize_model`` proves nothing about a lane: the rule has to run where a
 lane is actually settled. Every case here drives a shipped acceptance path — the ``settle`` verb (a
 real CLI process with stdin closed) and ``advance()`` (the bounded runner) — against a real ledger, a
 real worktree and a real sidecar, so what is asserted is what decides a live lane.
 
-The three measured defects this file covers:
+The rule, as measured, is two different things:
+
+* the **model pin** is the no-substitution guard. A pinned lane whose sidecar reports a different
+  model parks, and a pinned lane whose sidecar reports **no** model at all parks too (there is
+  nothing to show the pin held). One measured exception, and it is not a relaxation of the rule: a
+  harness that declares ``pin_verifiable=False`` (see ``harnesses.Harness`` and the codex notes)
+  passes the pin to the CLI but emits nothing that can corroborate it, so a reported difference
+  cannot be told apart from the agent guessing at its own name — there it is the advisory
+  ``identity_warning``, and the lane is decided on its real evidence;
+* the **harness** is not a guard at all. oprun picked the binary from the registry, so the worker's
+  spelling is recorded verbatim (``harness_reported``) and warned about (``identity_warning``), and
+  never enforced. A live two-vendor run parked a correct ``droid`` lane — right binary, verified in
+  the journal — because the agent self-reported ``cursor-agent``: parking correct work on an
+  unreliable self-report is a false-negative generator.
+
+The defects this file covers, in the order they were measured:
 
 * **the pin was never passed** — ``argv_for`` appended ``--model`` only for a harness with
   ``requires_model_pin`` (``claude``), so a codex lane ran its own default while the ledger recorded
@@ -15,10 +31,16 @@ The three measured defects this file covers:
   rebuilt its evidence without them, so nothing ever compared requested against reported: a lane that
   reported ``gpt-6-astra`` against a ``gpt-5.6-sol`` pin was accepted as ``completed``;
 * **the alias did not resolve** — ``--harness openai-codex`` was an unknown registry id, so the
-  frozen two-vendor command failed before it dispatched anything.
+  frozen two-vendor command failed before it dispatched anything;
+* **the harness half of the guard was a false-negative generator** — it parked a lane that ran the
+  designated binary and reported the wrong CLI name, so the harness self-report is now advisory;
+* **codex cannot corroborate its pin** — measured: the pin reaches the model layer, ``exec --json``
+  emits no model id, and the agent's own answer is a wrong guess, so a reported mismatch there says
+  nothing about substitution.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 import sys
@@ -41,6 +63,10 @@ TEST_PASS = [sys.executable, "-c", "raise SystemExit(0)"]
 
 #: Both acceptance paths. Every case below is asserted on each, because both must decide it.
 PATHS = ("settle", "advance")
+
+#: A harness whose model pin CAN be corroborated (``pin_verifiable=True``): a reported mismatch is
+#: fatal. ``codex`` deliberately is not used here — see the codex cases below.
+VERIFIABLE_HARNESS = "droid"
 
 
 # --- fixtures ----------------------------------------------------------------
@@ -110,19 +136,46 @@ def assert_parked(fixture: dict, path: str, result, *needles: str) -> dict:
     return lane
 
 
+def assert_accepted(fixture: dict, path: str, result, *warning_needles: str) -> dict:
+    """The lane was ACCEPTED on the normal evidence rule, with an advisory warning naming the strings.
+
+    ``assert_parked``'s mirror image, and the only shape the harness half of the guard may produce: the
+    lane is ``completed``, the acceptance path said so out loud (exit 0 / listed in ``accepted``), and
+    ``identity_warning`` is present in the settled evidence, naming what disagreed.
+    """
+    lane = lane_record(fixture)
+    assert lane["status"] == COMPLETED, lane.get("needs_review_reason")
+    assert COMPLETED in {entry["to"] for entry in lane["history"]}
+    if path == "settle":
+        assert result.returncode == 0, result.stderr
+    else:
+        assert fixture["lane"] in result["accepted"], result
+    warning = lane["evidence"]["identity_warning"]
+    for needle in warning_needles:
+        assert needle in warning, warning
+    return lane
+
+
 # --- defect 2: a different model is never accepted ---------------------------
 @pytest.mark.parametrize("path", PATHS)
 def test_a_substituted_model_parks_the_lane_and_names_both_strings(tmp_path: Path, path: str):
-    """The measured live defect: requested ``gpt-5.6-sol``, reported ``gpt-6-astra``, accepted."""
-    fixture = mission(tmp_path, harness="codex", model="gpt-5.6-sol")
-    sidecar(fixture["worktree"], fixture["dispatch_id"], harness="codex", model="gpt-6-astra")
+    """The measured live defect, on a harness whose pin can be corroborated: requested, reported differ.
+
+    ``VERIFIABLE_HARNESS`` and not ``codex``: codex passes its pin but emits nothing that names the
+    model that ran, so its mismatch is advisory (see the codex cases below). Where the comparison can
+    establish something, a mismatch is still fatal — that half of the rule must not move.
+    """
+    fixture = mission(tmp_path, harness=VERIFIABLE_HARNESS, model="gpt-5.6-sol")
+    sidecar(fixture["worktree"], fixture["dispatch_id"], harness=VERIFIABLE_HARNESS,
+            model="gpt-6-astra")
 
     lane = assert_parked(fixture, path, accept(path, fixture), "gpt-5.6-sol", "gpt-6-astra")
 
     assert lane["evidence"]["model_requested"] == "gpt-5.6-sol"
     assert lane["evidence"]["model_reported"] == "gpt-6-astra", "the raw report is never repaired"
-    assert lane["evidence"]["harness_reported"] == "codex"
-    assert lane["evidence"]["harness"] == "codex"
+    assert lane["evidence"]["harness_reported"] == VERIFIABLE_HARNESS
+    assert lane["evidence"]["harness"] == VERIFIABLE_HARNESS
+    assert lane["evidence"]["identity_warning"] == "", "an agreeing harness raises no advisory"
 
 
 @pytest.mark.parametrize("path", PATHS)
@@ -142,15 +195,20 @@ def test_a_respelled_pin_is_the_same_model_and_is_accepted(tmp_path: Path, path:
         assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("harness_id", (VERIFIABLE_HARNESS, "codex"))
 @pytest.mark.parametrize("path", PATHS)
-def test_a_pin_that_was_never_reported_is_not_accepted(tmp_path: Path, path: str):
+def test_a_pin_that_was_never_reported_is_not_accepted(tmp_path: Path, path: str,
+                                                       harness_id: str):
     """An unreported model cannot be shown to match the designation, so it parks (documented rule).
 
     The sidecar exists and claims success; it simply does not say which model ran. Accepting it would
     assert the pin held on no evidence at all — which is the failure this check exists to stop.
+
+    Parametrised over a verifiable harness **and** codex on purpose: ``pin_verifiable=False`` buys an
+    escape from a *reported difference* only. Having no report at all stays fatal on every harness.
     """
-    fixture = mission(tmp_path, harness="codex", model="gpt-5.6-sol")
-    sidecar(fixture["worktree"], fixture["dispatch_id"], harness="codex", omit=("model",))
+    fixture = mission(tmp_path, harness=harness_id, model="gpt-5.6-sol")
+    sidecar(fixture["worktree"], fixture["dispatch_id"], harness=harness_id, omit=("model",))
 
     lane = assert_parked(fixture, path, accept(path, fixture), "gpt-5.6-sol", "not reported")
 
@@ -175,6 +233,7 @@ def test_no_model_designation_is_not_a_substitution(tmp_path: Path, path: str):
     assert lane["status"] == COMPLETED
     assert lane["evidence"]["model_requested"] is None
     assert lane["evidence"]["model_reported"] == "Cursor Grok 4.6"
+    assert lane["evidence"]["identity_warning"] == "", "no pin means nothing to advise about"
     if path == "settle":
         assert result.returncode == 0, result.stderr
 
@@ -192,6 +251,7 @@ def test_two_spellings_of_one_cli_do_not_split_identity(tmp_path: Path, path: st
     assert lane["status"] == COMPLETED, lane.get("needs_review_reason")
     assert lane["evidence"]["harness"] == "cursor-agent", "the identity comes from the registry"
     assert lane["evidence"]["harness_reported"] == "cursor", "the worker's spelling, verbatim"
+    assert lane["evidence"]["identity_warning"] == "", "an alias is not a disagreement"
     if path == "settle":
         assert result.returncode == 0, result.stderr
 
@@ -209,30 +269,44 @@ def test_a_provider_spelling_of_the_registered_cli_is_the_same_harness(tmp_path:
     assert lane["status"] == COMPLETED, lane.get("needs_review_reason")
     assert lane["evidence"]["harness"] == "codex"
     assert lane["evidence"]["harness_reported"] == "openai-codex"
+    assert lane["evidence"]["identity_warning"] == "", "a provider spelling is the same CLI"
     if path == "settle":
         assert result.returncode == 0, result.stderr
 
 
+# --- the harness half: the registry decides, the self-report only advises ------
 @pytest.mark.parametrize("path", PATHS)
-def test_a_different_harness_parks_the_lane(tmp_path: Path, path: str):
-    """A lane registered as ``codex`` whose worker ran ``droid`` is not the designated lane."""
-    fixture = mission(tmp_path, harness="codex", model="gpt-5.6-sol")
-    sidecar(fixture["worktree"], fixture["dispatch_id"], harness="droid", model="gpt-5.6-sol")
+def test_a_wrong_harness_self_report_is_accepted_with_a_warning(tmp_path: Path, path: str):
+    """The live two-vendor defect: lane registered ``droid``, sidecar self-reported ``cursor-agent``.
 
-    lane = assert_parked(fixture, path, accept(path, fixture), "codex", "droid")
+    The binary was the registered one (verified in the journal, ``/home/logani/.local/bin/droid``), the
+    work was correct and the lane's test passed — and the guard parked it on the agent's own guess about
+    which CLI it was. oprun chose the binary from the registry, so that guess carries no information:
+    the lane is accepted on its real evidence, with the disagreement recorded and printed.
+    """
+    fixture = mission(tmp_path, harness="droid", model=None)
+    sidecar(fixture["worktree"], fixture["dispatch_id"], harness="cursor-agent", model=None)
 
-    assert lane["evidence"]["harness"] == "codex"
-    assert lane["evidence"]["harness_reported"] == "droid"
+    lane = assert_accepted(fixture, path, accept(path, fixture), "droid", "cursor-agent")
+
+    assert lane["evidence"]["harness"] == "droid", "the identity comes from the registry"
+    assert lane["evidence"]["harness_reported"] == "cursor-agent", "the worker's spelling, verbatim"
+    assert "model" not in lane["evidence"]["identity_warning"], "no pin, so no model advisory"
 
 
 @pytest.mark.parametrize("path", PATHS)
-def test_a_harness_that_was_never_reported_is_not_accepted(tmp_path: Path, path: str):
-    """Same rule as the model: an unreported harness cannot be shown to be the registered one."""
+def test_a_harness_that_was_never_reported_is_no_longer_fatal(tmp_path: Path, path: str):
+    """A sidecar that omits the harness is warned about, not parked: the registry id already won.
+
+    Same policy as a wrong spelling — the self-report is advisory either way, because ``harness`` in
+    the evidence is the lane's registry id and always was.
+    """
     fixture = mission(tmp_path, harness="codex", model="gpt-5.6-sol")
     sidecar(fixture["worktree"], fixture["dispatch_id"], omit=("harness",))
 
-    lane = assert_parked(fixture, path, accept(path, fixture), "codex", "not reported")
+    lane = assert_accepted(fixture, path, accept(path, fixture), "codex", "not reported")
 
+    assert lane["evidence"]["harness"] == "codex"
     assert lane["evidence"]["harness_reported"] is None
 
 
@@ -303,3 +377,72 @@ class TestHarnessAliases:
     def test_an_unknown_harness_is_still_refused(self):
         with pytest.raises(KeyError):
             oprun.canonical_harness("not-a-harness")
+
+
+# --- the pin that cannot be corroborated: measured, not assumed ---------------
+@pytest.mark.parametrize("path", PATHS)
+def test_codex_model_behaviour_matches_its_measured_pin_verifiability(tmp_path: Path, path: str):
+    """codex: the pin reaches the CLI, but nothing the CLI emits can corroborate it.
+
+    MEASURED on this box (codex-cli 0.153.4), and written into the entry's ``notes``:
+    ``codex exec --json -s workspace-write --model gpt-5.6-sol …`` emits exactly
+    ``thread.started``, ``turn.started``, ``item.completed`` and ``turn.completed`` — **no event
+    carries a model id** — while the pin demonstrably reaches the model layer (a bogus ``--model`` is
+    rejected with a 400, and the on-disk rollout records ``turn_context.model == "gpt-5.6-sol"``).
+    Asked for its own id under that pin, the agent answered ``"gpt-5.6-terra"``.
+
+    So the expectation is read from the registry rather than hardcoded: the contract is
+    ``pin_verifiable=False`` ⇒ a reported mismatch is advisory and the lane is accepted on its real
+    evidence; ``pin_verifiable=True`` ⇒ the mismatch stays fatal. Flipping the property without
+    re-measuring therefore flips this test's expectation with it.
+    """
+    fixture = mission(tmp_path, harness="codex", model="gpt-5.6-sol")
+    sidecar(fixture["worktree"], fixture["dispatch_id"], harness="codex", model="gpt-6-astra")
+
+    if harnesses.get("codex").pin_verifiable:
+        lane = assert_parked(fixture, path, accept(path, fixture), "gpt-5.6-sol", "gpt-6-astra")
+    else:
+        lane = assert_accepted(fixture, path, accept(path, fixture), "gpt-5.6-sol", "gpt-6-astra")
+
+    assert lane["evidence"]["model_requested"] == "gpt-5.6-sol"
+    assert lane["evidence"]["model_reported"] == "gpt-6-astra", "the raw report is never repaired"
+    assert lane["evidence"]["harness_reported"] == "codex"
+
+
+def test_the_codex_pin_verifiability_was_measured_not_assumed():
+    """The measurement, frozen where it can be re-checked: the entry says ``False`` and says why.
+
+    If this fails, codex changed how it reports (or the entry was edited without running anything):
+    re-run the command in ``notes`` and set the property from what it does.
+    """
+    harness = harnesses.get("codex")
+    assert harness.pin_verifiable is False, "codex cannot corroborate a supplied pin (measured)"
+    notes = harness.notes.lower()
+    assert "pin_verifiable=false" in notes
+    assert "no event carries a model id" in notes
+    assert "gpt-5.6-terra" in notes, "the observed self-report must stay in the entry"
+
+
+class TestPinVerifiabilityContract:
+    """The property is declared on the dataclass, and no registry entry may inherit it silently."""
+
+    def test_the_harness_dataclass_exposes_pin_verifiable_defaulting_to_strict(self):
+        field = harnesses.Harness.__dataclass_fields__["pin_verifiable"]
+        assert field.type in ("bool", bool), field.type
+        assert field.default is True, "the default reading is the strict one"
+
+    def test_every_registry_entry_has_it_set_explicitly(self):
+        """A field a default can fill is a field that can rot: the source must set each one."""
+        source = inspect.getsource(harnesses)
+        for harness_id in harnesses.CANONICAL_IDS:
+            entry = harnesses.HARNESSES[harness_id]
+            assert isinstance(entry.pin_verifiable, bool), harness_id
+            block = source.split(f'"{harness_id}": Harness(', 1)[1].split("\n    ),", 1)[0]
+            assert "pin_verifiable=" in block, f"{harness_id} relies on the default"
+
+    def test_only_a_measured_harness_is_marked_unverifiable(self):
+        """The strict default (``True``) is what an unmeasured harness gets."""
+        for harness_id in harnesses.CANONICAL_IDS:
+            if harness_id == "codex":
+                continue
+            assert harnesses.get(harness_id).pin_verifiable is True, harness_id

@@ -10,13 +10,26 @@ hard error rather than a guess.
 
 Every entry below was measured on this box on 2026-09-11. Nothing here is inferred from
 documentation, and no field may be filled in with a flag nobody ran. Data first: this
-module holds no behaviour beyond lookups and one pure comparison
-(:func:`identity_reason`), and it never executes a harness.
+module holds no behaviour beyond lookups and two pure comparisons (:func:`identity_reason`
+— the one rule that can park a lane — and :func:`identity_warning`, which can only advise),
+and it never executes a harness.
+
+**What the no-silent-substitution guard actually is.** The **model** pin is the guard: a lane
+pinned to one model whose worker reports another is parked, and both raw strings are kept. But the
+guard is only as strong as a harness's ability to report the model it ran, so each entry declares
+:attr:`Harness.pin_verifiable` — ``False`` where the pin reaches the CLI but nothing in the
+harness's own output can corroborate it, and then a reported-model mismatch is *advice*, not
+evidence. **Harness identity is the other half, and it is not a guard at all:** oprun picks the
+binary from this registry, so an agent's opinion about which CLI it is carries no routing
+information and is demonstrably unreliable — a lane launched as ``droid`` (binary verified in the
+journal) can self-report ``cursor-agent``, and parking correct work on that is a false-negative
+generator. So the registry id always wins, the worker's spelling is recorded verbatim, and any
+disagreement is recorded and printed as :func:`identity_warning` — never enforced.
 
 Stdlib plus one sibling import: :mod:`ledger`'s ``normalize_model`` is the single definition of
-"these two strings name the same model", so the identity rule here cannot drift from the
-comparison the ledger documents. The peer lane that owns ``scripts/probe.py`` consumes this
-registry; it is not imported by it.
+"these two strings name the same model", so the comparison here cannot drift from the comparison
+the ledger documents. The peer lane that owns ``scripts/probe.py`` consumes this registry; it is
+not imported by it.
 """
 from __future__ import annotations
 
@@ -37,8 +50,9 @@ CANONICAL_IDS: tuple[str, ...] = (
 )
 
 #: Accepted spellings that unambiguously mean one registry id. The ledger always records the
-#: canonical id, so two spellings of one CLI can never split its identity — and
-#: :func:`identity_reason` resolves through this table, never through raw string equality.
+#: canonical id, so two spellings of one CLI can never split its identity — and every comparison
+#: that mentions a harness resolves through this table (never through raw string equality), from
+#: :func:`canonical_id` at dispatch down to the advisory :func:`identity_warning`.
 #: ``openai-codex`` is the provider name a lane can be dispatched by (the frozen two-vendor
 #: benchmark's ``--harness openai-codex``) for the CLI whose registry id is ``codex``.
 HARNESS_ALIASES: dict[str, str] = {
@@ -68,6 +82,16 @@ class Harness:
     only where it was mandatory silently let a CLI run its own default while the ledger asserted
     the requested model. A CLI with no model flag at all declares ``model_flag=""``, and then a
     pin is **refused** (``KeyError``) rather than dropped.
+
+    ``pin_verifiable`` says whether that pin can be *checked* — whether anything the harness itself
+    emits names the model that ran. Passing a pin and being able to verify it are different
+    properties, and conflating them is how a guard turns into a false-negative generator: where the
+    pin provably reaches the CLI but no trustworthy model report comes back, a "mismatch" cannot be
+    told apart from the agent guessing at its own name, so it is advisory
+    (:func:`identity_warning`) instead of fatal. It defaults to ``True`` — the strict reading —
+    and only a measured harness may lower it. Declared last because every field above is
+    mandatory for the entry to be routable at all, while this one is a measurement that can be
+    revisited without touching the recipe.
     """
 
     id: str                      # one of CANONICAL_IDS
@@ -80,6 +104,7 @@ class Harness:
     requires_model_pin: bool     # True when it cannot run without an explicit model
     model_flag: str              # the flag that carries a model pin; "" = this CLI takes none
     notes: str
+    pin_verifiable: bool = True  # can a supplied pin be corroborated from the harness's own output?
 
 
 HARNESSES: dict[str, Harness] = {
@@ -93,6 +118,7 @@ HARNESSES: dict[str, Harness] = {
         witness_strength="strong",
         requires_model_pin=False,
         model_flag="--model",
+        pin_verifiable=True,
         notes=(
             "-p runs unattended with full write+shell access (--yolo skips the approval "
             "prompt, --trust skips the workspace-trust prompt) — so the worktree, not the "
@@ -111,12 +137,27 @@ HARNESSES: dict[str, Harness] = {
         witness_strength="strong",
         requires_model_pin=False,
         model_flag="--model",
+        # Measured, not assumed — see the notes below: the pin reaches the CLI, but nothing the
+        # exec stream emits names the model that ran, so a reported mismatch proves nothing.
+        pin_verifiable=False,
         notes=(
             "exec --json streams structured turn events; turn.completed is the terminator. "
             "There is no --max-turns flag, so a run has no self-imposed cap: wrap it in an "
             "external timeout and treat a missing turn.completed as a stall to escalate, "
             "never as something to keep waiting on. -s workspace-write is what makes it "
-            "able to edit the worktree unattended."
+            "able to edit the worktree unattended. "
+            "pin_verifiable=False, MEASURED on this box (codex-cli 0.153.4): "
+            "`codex exec --json -s workspace-write --model gpt-5.6-sol \"reply with the model "
+            "id you are running as\"` emits exactly thread.started, turn.started, item.completed "
+            "and turn.completed — NO event carries a model id — while the pin demonstrably "
+            "reaches the model layer (a bogus --model is rejected with a 400, and the on-disk "
+            "rollout records turn_context.model == \"gpt-5.6-sol\"). Asked for its own id under "
+            "that pin, the agent answered \"gpt-5.6-terra\", i.e. the worker's model self-report "
+            "is a guess and can be wrong in both directions. So a reported/model-pin mismatch "
+            "cannot distinguish a substitution from a naming difference and is advisory "
+            "(identity_warning), never a park; a pin that is not reported at all is still "
+            "needs_review, and nothing here weakens the harness-identity rule (the registry "
+            "decides that, and the worker's harness self-report is never trusted)."
         ),
     ),
     "droid": Harness(
@@ -129,6 +170,7 @@ HARNESSES: dict[str, Harness] = {
         witness_strength="strong",
         requires_model_pin=False,
         model_flag="--model",
+        pin_verifiable=True,
         notes=(
             "--auto <level> is what makes it unattended; without it the run asks for "
             "approval and looks idle. The exit code is the documented authoritative "
@@ -145,6 +187,7 @@ HARNESSES: dict[str, Harness] = {
         witness_strength="none",
         requires_model_pin=True,
         model_flag="--model",
+        pin_verifiable=True,
         notes=(
             "requires_model_pin: its default model 403s on this box, so an unpinned lane is "
             "not routable at all and is rejected at dispatch — supply an explicit --model. "
@@ -163,6 +206,7 @@ HARNESSES: dict[str, Harness] = {
         witness_strength="strong",
         requires_model_pin=False,
         model_flag="--model",
+        pin_verifiable=True,
         notes=(
             "Needs HOME=/home/logani, or the profile lookup resolves somewhere else. -p "
             "<profile> picks the profile and --query-file carries the brief, so an "
@@ -180,6 +224,7 @@ HARNESSES: dict[str, Harness] = {
         witness_strength="strong",
         requires_model_pin=False,
         model_flag="--model",
+        pin_verifiable=True,
         notes=(
             "Not on PATH: the absolute binary path is required, so a recipe that spells it "
             "'pi' fails to launch. Also needs HOME=/home/logani. -p is the unattended "
@@ -200,6 +245,7 @@ HARNESSES: dict[str, Harness] = {
         # rather than one measured here — but it is still *passed*: the ledger never asserts a
         # pin it did not hand to the CLI.
         model_flag="--model",
+        pin_verifiable=True,
         notes=(
             "Known to drop its terminator (opencode issues #26855 and #31435): the "
             "step_finish step is not reliably emitted, so a run can complete correctly and "
@@ -237,8 +283,8 @@ def canonical_id(harness_id: str) -> str:
 
     Raises :class:`KeyError` for an id that is neither a registry id nor an accepted spelling in
     :data:`HARNESS_ALIASES`. This is the only resolution path — dispatch, the acceptance paths and
-    :func:`identity_reason` all go through it, so ``cursor`` and ``cursor-agent`` are one CLI
-    everywhere and a typo is never routed somewhere plausible.
+    the advisory :func:`identity_warning` all go through it, so ``cursor`` and ``cursor-agent`` are
+    one CLI everywhere and a typo is never routed somewhere plausible.
     """
     canonical = HARNESS_ALIASES.get(harness_id, harness_id)
     get(canonical)          # raises KeyError for an unknown id: never a silent fallback
@@ -249,13 +295,30 @@ def _canonical_id_or_none(harness_id: str) -> str | None:
     """``canonical_id`` for a spelling a *worker* reported, or ``None`` when it is unknown.
 
     A worker's spelling is not validated input: it is a claim to compare against the lane's
-    designation, so "the registry does not know this spelling" is an answer (:func:`identity_reason`
-    turns it into a park), not a crash.
+    designation, and the comparison it feeds (:func:`identity_warning`) can only ever produce a note,
+    so "the registry does not know this spelling" is an answer (an unresolvable claim, noted as
+    such), not a crash — and never a park, because the registry id is what decided the binary either
+    way.
     """
     try:
         return canonical_id(harness_id)
     except KeyError:
         return None
+
+
+def _pin_verifiable(harness_id: str) -> bool:
+    """Whether a pin supplied to ``harness_id`` can be corroborated by what that harness reports.
+
+    An id this module cannot resolve (blank, or not in the registry) gets the strict reading
+    (``True``): a spelling the registry does not know is never a reason to relax the one guard
+    that still bites.
+    """
+    if not harness_id:
+        return True
+    try:
+        return get(canonical_id(harness_id)).pin_verifiable
+    except KeyError:
+        return True
 
 
 def identity_reason(*, harness: str | None, model_requested: str | None,
@@ -264,33 +327,30 @@ def identity_reason(*, harness: str | None, model_requested: str | None,
 
     This is the no-silent-substitution rule, and it is enforced on the **acceptance path** — the
     ``settle`` verb and the ``advance`` runner, both of which import it from here — not only in a
-    unit test. A lane whose worker reports a different model from the one the ledger pinned is
-    parked for review and is never recorded as ``completed``.
+    unit test. Exactly one thing can park a lane here, and it is the **model**:
 
     * the **model** is compared with ``ledger.normalize_model`` (casefold, then ``[-_ .]`` dropped):
       ``"Cursor Grok 4.6"`` and ``"cursor-grok-4.6"`` are one model, and two genuinely different
       pins are not — a naive string compare would false-positive the first pair;
-    * the **harness** is compared as *identity*, never as spelling: a worker reporting ``cursor``
-      for a lane registered as ``cursor-agent`` is the same CLI (:data:`HARNESS_ALIASES`), so two
-      spellings can never split a harness's identity;
-    * a designation that was **not reported** cannot be shown to hold: a pinned lane whose sidecar
-      omits the model (or a lane whose sidecar reports no harness at all) is a mismatch, not a pass;
+    * a pinned lane whose sidecar **does not report a model at all** cannot be shown to hold, so it
+      parks — regardless of harness, because "the pin was applied" would otherwise be asserted on no
+      evidence;
+    * a reported model that differs from the pin parks **only where the harness can be believed**:
+      :attr:`Harness.pin_verifiable` says whether anything the CLI emits names the model that ran.
+      Where it cannot (codex: the ``exec --json`` stream carries no model id, and the agent's own
+      answer is a wrong guess), a mismatch is not evidence of a substitution — the difference may be
+      the CLI's naming, not the model — so it is advisory (:func:`identity_warning`) and the lane is
+      decided on its real evidence instead;
     * a lane with **no** model designation (``--model`` never passed, so the CLI auto-routes) has
       nothing to contradict — whatever it reports is recorded as-is and is not a substitution;
+    * the **harness** is *not* a parking rule. The registry chose the binary, so a worker's opinion
+      about which CLI it is has no information content: the ``harness``/``harness_reported``
+      arguments are accepted (one observation pair for both acceptance paths, and the one place a
+      future rule would look) and compared by :func:`identity_warning` only;
     * the raw strings are never rewritten, repaired or normalised into each other: callers store
       both, exactly as reported, whichever way the comparison went.
     """
     registered = "" if harness is None else str(harness).strip()
-    if registered:
-        reported_harness = "" if harness_reported is None else str(harness_reported).strip()
-        if not reported_harness:
-            return (f"harness not reported: lane is registered as {registered!r} but the sidecar "
-                    f"reports harness={harness_reported!r}, so its identity cannot be shown")
-        registered_id = _canonical_id_or_none(registered) or registered
-        reported_id = _canonical_id_or_none(reported_harness) or reported_harness
-        if reported_id.casefold() != registered_id.casefold():
-            return (f"harness substitution: lane is registered as {registered!r} but the sidecar "
-                    f"reports harness {harness_reported!r}")
     requested = "" if model_requested is None else str(model_requested).strip()
     if not requested:
         return ""
@@ -298,10 +358,63 @@ def identity_reason(*, harness: str | None, model_requested: str | None,
     if not reported_model:
         return (f"model not reported: lane is pinned to {model_requested!r} but the sidecar "
                 f"reports model={model_reported!r}, so the pin cannot be shown to hold")
-    if normalize_model(requested) != normalize_model(reported_model):
-        return (f"model substitution: lane requested {model_requested!r} but the sidecar reports "
-                f"{model_reported!r}")
-    return ""
+    if normalize_model(requested) == normalize_model(reported_model):
+        return ""
+    if not _pin_verifiable(registered):
+        # The comparison cannot establish anything for this harness, so it must not fail the lane;
+        # identity_warning records it for the reader.
+        return ""
+    return (f"model substitution: lane requested {model_requested!r} but the sidecar reports "
+            f"{model_reported!r}")
+
+
+def identity_warning(*, harness: str | None, model_requested: str | None,
+                     harness_reported: object, model_reported: object) -> str:
+    """Advisory notes about a worker's *self-report*; ``""`` when there is nothing to say.
+
+    **This function never influences acceptance.** It exists because the honest output of a
+    comparison that cannot decide anything is a note, not a verdict:
+
+    * a reported harness that disagrees with the registry id (after alias canonicalisation), or that
+      is not reported at all, is recorded as a warning — the registry decided the binary and the
+      registry wins, so this can only ever be a signal for the reader. A lane that ran the right CLI
+      while self-reporting the wrong one (measured live: registered ``droid``, binary verified in the
+      journal, sidecar said ``cursor-agent``) is accepted on its real evidence, with the disagreement
+      written down;
+    * a reported model that disagrees with a pin on a harness whose ``pin_verifiable`` is ``False``
+      is a warning for the same reason: the comparison cannot tell a substitution from a naming
+      difference. A pin that was never reported is *not* in this category — that stays a park.
+    """
+    notes: list[str] = []
+    registered = "" if harness is None else str(harness).strip()
+    if registered:
+        reported_harness = "" if harness_reported is None else str(harness_reported).strip()
+        registered_id = _canonical_id_or_none(registered) or registered
+        if not reported_harness:
+            notes.append(
+                f"harness not reported: lane is registered as {registered!r} but the sidecar "
+                f"reports harness={harness_reported!r}; identity comes from the registry, so this "
+                f"is advisory only"
+            )
+        else:
+            reported_id = _canonical_id_or_none(reported_harness) or reported_harness
+            if reported_id.casefold() != registered_id.casefold():
+                notes.append(
+                    f"harness self-report disagrees: lane is registered as {registered!r} but the "
+                    f"sidecar reports harness {harness_reported!r} — oprun chose the binary from "
+                    f"the registry, so this is advisory only"
+                )
+    requested = "" if model_requested is None else str(model_requested).strip()
+    reported_model = "" if model_reported is None else str(model_reported).strip()
+    if (requested and reported_model and not _pin_verifiable(registered)
+            and normalize_model(requested) != normalize_model(reported_model)):
+        notes.append(
+            f"model self-report disagrees: lane is pinned to {model_requested!r} but the sidecar "
+            f"reports {model_reported!r}; harness {registered!r} cannot corroborate a supplied pin "
+            f"(pin_verifiable=False), so this cannot be told apart from a naming difference — "
+            f"advisory only"
+        )
+    return "; ".join(notes)
 
 
 def routable(harness_id: str, model_pin: str | None = None) -> bool:

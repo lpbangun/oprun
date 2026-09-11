@@ -14,11 +14,15 @@ Three rules are load-bearing:
    matches the lane's CURRENT ``dispatch_id``, reports ``status == "success"``, *and* the
    controller re-runs the lane's own ``test_cmd`` to exit 0. Nothing else can accept a lane. A
    dead unit with a valid sidecar is done; a live unit with no sidecar is not.
-2. **A substitution is never accepted.** The sidecar's ``harness``/``model`` are compared against
-   the lane's registry id and its requested pin (``identity_reason``, imported from the registry —
-   the same function the CLI's ``settle`` calls): a normalized model mismatch, a harness that is not
-   the registered one, or a pin that was never reported all PARK the lane. Both raw strings are kept
-   in the settled evidence, so "the requested model actually ran" is checkable after the fact.
+2. **A model substitution is never accepted.** The sidecar's ``model`` is compared against the lane's
+   requested pin (``identity_reason``, imported from the registry — the same function the CLI's
+   ``settle`` calls): a normalized mismatch, or a pin that was never reported at all, PARK the lane.
+   The one exception is a harness that declares ``pin_verifiable=False``, where the pin reaches the
+   CLI but nothing the CLI emits can corroborate it, so a reported mismatch proves nothing and is
+   recorded as an advisory ``identity_warning`` instead. Both raw strings are kept in the settled
+   evidence, so "the requested model actually ran" is checkable after the fact. **Harness identity is
+   not compared at all**: the registry picked the binary, so a worker's harness self-report is
+   recorded verbatim and warned about, never enforced (``identity_warning``).
 3. **A unit's lifetime answers "should I keep waiting?" — never "is it done?"** (see
    :func:`_unit_lifetime`). At the deadline it decides exactly one thing: whether a *missing*
    sidecar is still possible. A still-active unit is left alone (the worker may be about to write
@@ -55,11 +59,13 @@ from ledger import TERMINAL, Ledger
 import launch  # sibling module: the only detach/lifetime authority (scripts/launch.py)
 # The identity rule — did this lane run the model and harness the ledger designated? — lives with
 # the registry that owns the harness ids and their accepted spellings, and the CLI's ``settle``
-# imports the same function. One rule, two acceptance paths: the runner can never disagree with the
-# CLI about a substitution. The import is deliberately NOT optional — a guarantee that can silently
-# be absent is not a guarantee — and it stays a leaf import (``harnesses`` imports nothing but the
-# ledger), so ``advance`` still runs with or without ``probe.py``.
-from harnesses import identity_reason  # sibling module: the registry's identity rule
+# imports the same functions. One rule, two acceptance paths: the runner can never disagree with the
+# CLI about a substitution. ``identity_reason`` can park a lane (the model pin); ``identity_warning``
+# can only ever be recorded and printed (a harness self-report, or a model report on a harness that
+# cannot corroborate a pin). The imports are deliberately NOT optional — a guarantee that can
+# silently be absent is not a guarantee — and they stay leaf imports (``harnesses`` imports nothing
+# but the ledger), so ``advance`` still runs with or without ``probe.py``.
+from harnesses import identity_reason, identity_warning  # sibling: the registry's identity rule
 
 try:  # scripts/probe.py is written by a sibling lane; advance must not require it
     from probe import probe as _probe_lane  # type: ignore[import-not-found]
@@ -236,9 +242,16 @@ def lane_verdict(lane: dict, *, lane_id: str = "", unit_active: bool | None = No
     if why:
         return {"verdict": FAILED_VERDICT, "reason": why, "case": "unusable_artifact",
                 "evidence": found}
-    # The artifact is well-formed and claims success — now check it claims the RIGHT run: the model
-    # the lane asked for and the harness it was registered under. A substitution (or a pin that was
-    # never reported) is a failed dispatch, so it parks and is never accepted.
+    # The artifact is well-formed and claims success — now check it claims the RIGHT run. The model
+    # pin is the guard: a mismatch (or a pin that was never reported) is a failed dispatch, so it
+    # parks and is never accepted — except where the harness declares ``pin_verifiable=False``, in
+    # which case the comparison cannot establish anything and ``identity_warning`` records it for the
+    # reader instead. The harness itself is never compared here: the registry chose the binary, so a
+    # worker's harness self-report carries no routing information and can only ever produce a
+    # warning. The warning is computed before the verdict so BOTH outcomes carry it in evidence.
+    found["identity_warning"] = identity_warning(
+        harness=lane.get("harness"), model_requested=lane.get("model_requested"),
+        harness_reported=payload.get("harness"), model_reported=payload.get("model"))
     identity = identity_reason(harness=lane.get("harness"),
                                model_requested=lane.get("model_requested"),
                                harness_reported=payload.get("harness"),
@@ -417,9 +430,15 @@ def _append_unique(items: list[str], value: str) -> None:
 def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, reason: str,
                  emit: Callable[[str], None], *, verdict: dict | None = None,
                  witness: dict | None = None, exit_code: int | None = None) -> _Decision:
-    """Refuse an outcome: the lane goes to ``needs_review`` — and never to ``completed``."""
+    """Refuse an outcome: the lane goes to ``needs_review`` — and never to ``completed``.
+
+    The advisory ``identity_warning`` travels with the park: a lane can be parked for a model
+    substitution while its harness self-report is also wrong, and a reviewer should see both facts
+    without having to read the sidecar again. It is recorded, printed, and never the reason.
+    """
     lane = led.lane(lane_id)
     facts = ((verdict or {}).get("evidence") or {}).get("facts") or {}
+    warning = str(((verdict or {}).get("evidence") or {}).get("identity_warning") or "")
     evidence = {
         "controller": "advance",
         "dispatch_id": dispatch_id,
@@ -432,6 +451,7 @@ def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, rea
         "harness_reported": facts.get("harness"),
         "model_requested": lane.get("model_requested"),
         "model_reported": facts.get("model"),
+        "identity_warning": warning,
         "test_exit_code": exit_code,
         "witness": witness,
         "checked_at": _utc_now(),
@@ -441,6 +461,8 @@ def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, rea
         emit(f"[{lane_id}] SETTLE_REFUSED {result.get('reason')}")
         return _Decision(lane_id, "parked", "evidence",
                          f"ledger refused the settlement: {result.get('reason')}")
+    if warning:
+        emit(f"[{lane_id}] IDENTITY_WARNING advisory {warning}")
     suffix = f" exit={exit_code}" if exit_code is not None else ""
     emit(f"[{lane_id}] NEEDS_REVIEW{suffix} {reason}")
     return _Decision(lane_id, "parked", category, reason)
@@ -516,6 +538,9 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         "harness_reported": (verdict["evidence"].get("facts") or {}).get("harness"),
         "model_requested": lane.get("model_requested"),
         "model_reported": (verdict["evidence"].get("facts") or {}).get("model"),
+        # Advisory only, recorded on every settlement so the reader never has to re-derive it: an
+        # accepted lane can still carry a disagreeing harness self-report.
+        "identity_warning": str(verdict["evidence"].get("identity_warning") or ""),
         "test_cmd": [str(part) for part in (lane.get("test_cmd") or [])],
         "test_exit_code": exit_code,
         "test_result": "pass",
@@ -531,6 +556,8 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         emit(f"[{lane_id}] SETTLE_REFUSED {result.get('reason')}")
         return _Decision(lane_id, "parked", "evidence",
                          f"ledger refused the settlement: {result.get('reason')}")
+    if evidence["identity_warning"]:
+        emit(f"[{lane_id}] IDENTITY_WARNING advisory {evidence['identity_warning']}")
     emit(f"[{lane_id}] ACCEPTED exit=0 OK")
     return _Decision(lane_id, "accepted", "ok", f"exit=0 ({note})")
 
