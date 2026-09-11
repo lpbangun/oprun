@@ -1,5 +1,12 @@
 """oprun v0.2 ledger — pure transition table, dispatch fencing, circuit breaker, flock.
 
+It also hosts :func:`git_evidence`, the **one** builder of git evidence. Both acceptance paths
+(``oprun settle --accept``, attended, and ``scripts/advance.py``, unattended) call it: two copies
+of that rule drifted once already, and the drifted copy recorded the worktree's HEAD as the lane's
+``commit`` even when the lane had never committed — which, for a lane cut from the shared base, is
+the base SHA. Evidence that names the base as the lane's work is worse than evidence that names
+nothing.
+
 Shipped implementation, ported (not reinvented) from two proven references on this box:
 
   ``/tmp/canary3/oprun_ledger.py``  transitions + fencing + circuit breaker (10/10 green)
@@ -16,8 +23,10 @@ No daemon, no database, no second authority: stdlib only, files over RPCs.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -87,6 +96,128 @@ def normalize_model(name: str) -> str:
     is normalised.
     """
     return "".join(ch for ch in name.casefold() if ch not in MODEL_SEPARATORS)
+
+
+# --- git evidence: the ONE builder both acceptance paths call -----------------
+#
+# ``oprun settle --accept`` (attended) and ``scripts/advance.py`` (unattended) must describe the
+# same worktree the same way, so they must not each carry their own copy of this rule. They did,
+# and the copy in ``advance`` recorded ``git rev-parse HEAD`` as the lane's ``commit`` even when the
+# lane still had uncommitted work — for a lane cut from the shared base that is the BASE SHA, so
+# three parallel lanes' evidence was indistinguishable and the ledger named work the lane never did.
+# There is one function now, and no ``commit`` it returns is ever the commit the lane started from.
+
+#: Wall-clock ceiling for one read-only git query made while building evidence.
+GIT_TIMEOUT = 30.0
+#: Changed paths hashed for the uncommitted-work evidence path, so one huge lane cannot bloat the
+#: ledger.
+HASH_LIMIT = 50
+
+
+def _git(worktree: Path, *args: str) -> tuple[int, str, str]:
+    """Run one read-only git command in ``worktree``. ``(rc, stdout, stderr)`` — never raises."""
+    try:
+        proc = subprocess.run(["git", "-C", str(worktree), *args], capture_output=True,
+                              text=True, timeout=GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 128, "", str(exc)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _head(worktree: Path) -> str | None:
+    """The worktree's HEAD, or ``None`` when git cannot say (never a guess)."""
+    rc, out, _ = _git(worktree, "rev-parse", "HEAD")
+    head = out.strip()
+    return head if rc == 0 and head else None
+
+
+def _current_branch(worktree: Path) -> str | None:
+    """The checked-out branch name, or ``None`` when detached/unknown (never a guess)."""
+    rc, out, _ = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    name = out.strip()
+    return name if rc == 0 and name and name != "HEAD" else None
+
+
+def _toplevel(worktree: Path) -> Path:
+    """The repository root ``worktree`` belongs to (porcelain paths are relative to it)."""
+    rc, out, _ = _git(worktree, "rev-parse", "--show-toplevel")
+    root = out.strip()
+    return Path(root) if rc == 0 and root else Path(worktree)
+
+
+def _porcelain_paths(status: str) -> list[str]:
+    """Changed paths from ``status --porcelain``, renames resolved to the new name.
+
+    The output is sliced, never stripped as a whole first: the first line of a worktree-only change
+    begins with a space (``" M work.txt"``), and a blanket strip turns that path into ``ork.txt`` —
+    evidence that silently hashes a file that does not exist.
+    """
+    paths: list[str] = []
+    for line in status.splitlines():
+        if not line.strip():
+            continue
+        paths.append(line[3:].strip().split(" -> ")[-1])
+    return paths
+
+
+def _content_hashes(base: Path, paths: list[str],
+                    count: int = HASH_LIMIT) -> dict[str, str | None]:
+    """sha256 per changed path, so uncommitted work is identifiable without a commit.
+
+    An untracked directory (``.oprun/`` and friends) is digested too — it is part of what the lane
+    produced; a path that is gone (deleted/renamed away) is honestly ``None``.
+    """
+    hashes: dict[str, str | None] = {}
+    for rel in paths[:count]:
+        target = base / rel
+        try:
+            if target.is_file():
+                hashes[rel] = hashlib.sha256(target.read_bytes()).hexdigest()
+            elif target.is_dir():
+                digest = hashlib.sha256()
+                files = sorted(path for path in target.rglob("*") if path.is_file())
+                for path in files[:count]:
+                    digest.update(str(path.relative_to(base)).encode("utf-8"))
+                    digest.update(hashlib.sha256(path.read_bytes()).digest())
+                hashes[rel] = f"dir:{digest.hexdigest()}:{len(files)}files"
+            else:
+                hashes[rel] = None
+        except OSError:
+            hashes[rel] = None
+    return hashes
+
+
+def git_evidence(worktree: Path | str, base_commit: str | None = None) -> dict:
+    """``branch`` / ``commit`` / ``uncommitted`` / ``hashes`` for a lane's worktree.
+
+    ``commit`` is **the lane's own commit, or nothing** — never the commit the lane started from:
+
+    * uncommitted changes present -> ``commit: None``, ``uncommitted: True``, and ``hashes``
+      identifies the work. This is the common lane case: a worker edits and does not commit.
+    * worktree clean and HEAD differs from ``base_commit`` (the lane's starting commit, anchored by
+      :meth:`Ledger.dispatch`) -> ``commit`` is that HEAD, ``uncommitted: False``, ``hashes: {}``.
+    * worktree clean, HEAD unknown or still the starting commit (the lane did nothing) ->
+      ``commit: None``: without an anchor git cannot prove the HEAD is the lane's own work, so
+      nothing is claimed on its behalf.
+    * git unavailable or failed -> the reason is recorded as ``git_error``, ``commit: None``.
+
+    A lane that committed and then kept working reports the uncommitted branch (``commit: None``,
+    hashes for the newer work): the commit is not what the worktree currently holds.
+    """
+    worktree = Path(worktree)
+    rc_status, status, status_err = _git(worktree, "status", "--porcelain")
+    if rc_status != 0:
+        return {"branch": _current_branch(worktree), "commit": None, "uncommitted": None,
+                "hashes": {},
+                "git_error": (status_err or status).strip() or f"git status exited {rc_status}"}
+    paths = _porcelain_paths(status)
+    if paths:
+        return {"branch": _current_branch(worktree), "commit": None, "uncommitted": True,
+                "hashes": _content_hashes(_toplevel(worktree), paths)}
+    head = _head(worktree)
+    committed = head if (head and base_commit and head != base_commit) else None
+    return {"branch": _current_branch(worktree), "commit": committed, "uncommitted": False,
+            "hashes": {}}
 
 
 class Ledger:
@@ -163,6 +294,11 @@ class Ledger:
             "parent_dispatch": parent_dispatch,
             "depth": depth,
             "dispatch_id": None,
+            #: The commit the lane started from, anchored once at its first dispatch. Evidence
+            #: compares HEAD against this to tell "the lane committed its own work" (HEAD moved)
+            #: from "the lane is still sitting on the commit it was cut from" (HEAD unchanged, so
+            #: there is no lane commit to name). Additive field: nothing is renamed or removed.
+            "base_commit": None,
             "attempt": 0,
             "consecutive_failures": 0,
             "accepted": [],              # dispatch ids whose settlement was accepted
@@ -245,6 +381,12 @@ class Ledger:
             self._move(lane, event, new)
             lane["attempt"] += 1
             lane["dispatch_id"] = f"{lane_id}-d{lane['attempt']}"
+            # Anchor the lane's STARTING commit, once, in the same atomic write as its dispatch
+            # token — so a lane can never be dispatched without its anchor, and a retry cannot move
+            # the anchor onto a commit the lane itself made. A worktree git cannot read leaves the
+            # anchor ``None`` (unknown); evidence then claims no commit rather than guessing one.
+            if not lane.get("base_commit"):
+                lane["base_commit"] = _head(Path(str(lane.get("worktree") or ".")))
             self._write()
             return lane["dispatch_id"]
 
