@@ -15,6 +15,7 @@ cases use the shipped ``ledger.py`` rather than a stub.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -25,6 +26,12 @@ from ledger import BLOCKED, DISPATCHED, FAILED, Ledger
 
 GREEN_TEST_CMD = [sys.executable, "-c", "raise SystemExit(0)"]
 RED_TEST_CMD = [sys.executable, "-c", "raise SystemExit(3)"]
+
+#: A program that exists nowhere: the controller cannot START the command at all. This is the
+#: environment failing (issue #1's ENOENT), never the lane's tests failing.
+ENOENT_TEST_CMD = ["oprun-no-such-program-xyz"]
+#: A command that outlives the controller's own budget, for the timeout half of the same rule.
+SLOW_TEST_CMD = [sys.executable, "-c", "import time; time.sleep(30)"]
 
 CLAUDE_CANARY_403 = (
     '{"is_error":true,"subtype":"success","api_error_status":403,"type":"result",'
@@ -92,7 +99,15 @@ def run_probe(lane: dict, *, unit_active: bool = False, timeout_exceeded: bool =
 
 # --- vocabulary --------------------------------------------------------------
 def test_verdict_vocabulary_is_frozen() -> None:
-    assert probe.VERDICTS == ("done", "pending", "needs_input", "stalled", "failed")
+    """The vocabulary is closed: exactly these words, and ``infra`` is the one issue #1 added.
+
+    ``infra`` is not a lane outcome at all — it says the controller could not RUN the lane's
+    acceptance command (ENOENT, not executable, or its own budget ran out), so no test was proven
+    either way. It is kept apart from ``failed``/``needs_input`` because an environment fault must
+    never be read as a red test.
+    """
+    assert probe.VERDICTS == ("done", "infra", "pending", "needs_input", "stalled", "failed")
+    assert len(set(probe.VERDICTS)) == len(probe.VERDICTS), "one word per verdict, no aliases"
 
 
 def test_every_verdict_returned_is_in_the_vocabulary(tmp_path: Path) -> None:
@@ -264,6 +279,191 @@ def test_lane_without_test_cmd_is_never_done(tmp_path: Path) -> None:
     lane = make_lane(tmp_path, worktree=worktree, test_cmd=[])
     write_sidecar(worktree, "lane-a-d1")
     assert run_probe(lane)["verdict"] == "needs_input"
+
+
+# --- infra: the controller could not RUN the command (issue #1) ---------------
+def test_enoent_test_cmd_is_infra_never_failed(tmp_path: Path) -> None:
+    """Issue #1: a command the controller cannot START is ``infra``, never ``failed``.
+
+    The lane's sidecar is good and its tests were never proven red — the program simply is not on
+    this host. Reading that as a lane failure parks the lane and strikes the circuit breaker for
+    something the lane never did, which is the bug this verdict exists to prevent.
+    """
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=ENOENT_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "infra", result
+    assert result["verdict"] != "failed"
+    assert result["verdict"] != "done"
+    assert result["verdict"] != "needs_input", "an ENOENT is not 'a human must decide on evidence'"
+    assert result["evidence"]["test_rc"] == probe.TEST_CMD_NOT_RUNNABLE_RC == 127
+    assert ENOENT_TEST_CMD[0] in result["evidence"]["infra_reason"]
+
+
+def test_enoent_test_cmd_leaves_the_sidecar_evidence_untouched(tmp_path: Path) -> None:
+    """The infra verdict is about the environment only: every artifact check still ran and passed."""
+    worktree = make_worktree(tmp_path)
+    (worktree / "stats.py").write_text("mean = 1\n")
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=ENOENT_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1", files=("stats.py",))
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "infra"
+    assert result["evidence"]["sidecar_present"] is True
+    assert result["evidence"]["sidecar_status"] == "success"
+    assert result["evidence"]["missing_evidence_paths"] == []
+
+
+def test_timed_out_test_cmd_is_infra_never_failed(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of the same rule: the controller's own budget killing the run is not a test."""
+    monkeypatch.setattr(probe, "TEST_CMD_TIMEOUT_SECONDS", 0.5)
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=SLOW_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "infra", result
+    assert result["verdict"] != "failed"
+    assert result["evidence"]["test_rc"] == probe.TEST_CMD_TIMEOUT_RC == 124
+    assert "timed out" in result["evidence"]["infra_reason"]
+
+
+def test_a_red_test_cmd_is_never_infra(tmp_path: Path) -> None:
+    """The line the fix must not blur: a test that RAN and failed stays a decision for a human."""
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=RED_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "needs_input"
+    assert result["verdict"] != "infra"
+    assert result["evidence"]["test_rc"] == 3
+    assert result["evidence"].get("infra_reason") is None
+
+
+def test_run_test_cmd_separates_infra_from_a_red_test(tmp_path: Path) -> None:
+    """The classifier itself, at the level the controller calls it."""
+    rc, _tail, infra_reason = probe._run_test_cmd(ENOENT_TEST_CMD, tmp_path)
+    assert rc == 127 and infra_reason
+
+    rc, _tail, infra_reason = probe._run_test_cmd(RED_TEST_CMD, tmp_path)
+    assert rc == 3 and infra_reason == "", "a red test carries no infra reason"
+
+    rc, _tail, infra_reason = probe._run_test_cmd(GREEN_TEST_CMD, tmp_path)
+    assert rc == 0 and infra_reason == ""
+
+
+# --- the PATH the controller re-runs under (the worker's PATH, or the ambient one) -----------
+#: A tool that exists in ONE directory and nowhere else on this host: the bare name resolves only
+#: when the re-run's PATH contains that directory. That is the whole asymmetry under test — the
+#: worker's unit was pinned with such a PATH, and the controller's own PATH is a different variable.
+BARE_TOOL_NAME = "oprun-path-parity-tool"
+
+#: Prints the PATH the re-run actually handed the child, so the environment is observable output.
+PRINT_PATH_TEST_CMD = [sys.executable, "-c", "import os; print(os.environ.get('PATH'))"]
+
+
+def make_bare_tool(directory: Path, name: str = BARE_TOOL_NAME) -> Path:
+    """An executable reachable by its bare name only from ``directory`` (or another PATH entry)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    tool = directory / name
+    tool.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(0)\n", encoding="utf-8")
+    tool.chmod(0o755)
+    return tool
+
+
+def test_the_recorded_path_is_exactly_what_the_test_cmd_is_rerun_with(tmp_path: Path) -> None:
+    """A lane's recorded launch PATH reaches the re-run verbatim — no merge, no heuristic."""
+    recorded = "/opt/lane-tools:/usr/bin:/bin"
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=PRINT_PATH_TEST_CMD)
+    lane[probe.UNIT_PATH_FIELD] = recorded
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "done", result
+    assert result["evidence"]["unit_path"] == recorded
+    assert result["evidence"]["test_output_tail"].strip() == recorded
+
+
+def test_a_recorded_path_makes_a_bare_tool_name_runnable_for_the_controller(tmp_path: Path) -> None:
+    """The defect: the tool the lane's worker used must still resolve when the controller re-runs.
+
+    ``BARE_TOOL_NAME`` lives only in ``tool_dir`` — the PATH that unit was launched with — so the
+    acceptance re-run can only start it by running under that recorded PATH.
+    """
+    tool_dir = tmp_path / "lane-tools"
+    make_bare_tool(tool_dir)
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=[BARE_TOOL_NAME])
+    lane[probe.UNIT_PATH_FIELD] = str(tool_dir)
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "done", result
+    assert result["evidence"]["test_rc"] == 0
+
+
+def test_without_a_recorded_path_the_same_bare_tool_is_unrunnable_not_red(tmp_path: Path) -> None:
+    """The control for the case above: no recorded PATH means the ambient one, and nothing more.
+
+    The bare name is not on the controller's PATH, so the command cannot be STARTED — rc 127, the
+    ``infra`` environment fault, never a red test (issue #1). This is the asymmetry the recorded
+    PATH removes; it must not be "fixed" by inventing a PATH.
+    """
+    tool_dir = tmp_path / "lane-tools"
+    make_bare_tool(tool_dir)
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=[BARE_TOOL_NAME])
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "infra", result
+    assert result["evidence"]["unit_path"] is None
+    assert result["evidence"]["test_rc"] == 127
+    assert BARE_TOOL_NAME in result["evidence"]["infra_reason"]
+
+
+def test_a_lane_without_a_recorded_path_reruns_with_the_ambient_environment(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Back-compat: a ledger written before ``unit_path`` existed keeps its old environment.
+
+    ``env=None`` is what "inherit the ambient environment" means, so a tool reachable only through
+    the ambient PATH still resolves for the re-run. This is asserted behaviourally (the tool runs)
+    rather than by string equality: ``probe`` keeps only the last 400 characters of the command's
+    output as evidence, and a real PATH is longer than that.
+    """
+    tool_dir = tmp_path / "ambient-tools"
+    make_bare_tool(tool_dir)
+    ambient = [entry for entry in (os.environ.get("PATH") or "").split(os.pathsep) if entry]
+    monkeypatch.setenv("PATH", os.pathsep.join((str(tool_dir), *ambient)))
+
+    lane = make_lane(tmp_path, test_cmd=[BARE_TOOL_NAME])
+    write_sidecar(Path(lane["worktree"]), "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "done", result
+    assert result["evidence"]["unit_path"] is None
+    assert result["evidence"]["test_rc"] == 0
+
+
+def test_the_rerun_env_invents_nothing_for_an_absent_path() -> None:
+    """``None`` (or blank) is "inherit", never a fabricated PATH: no defaults, no resolution."""
+    assert probe._test_cmd_env(None) is None
+    assert probe._test_cmd_env("") is None
+    assert probe._test_cmd_env("   ") is None
+    assert probe._test_cmd_env("/venv/bin") == {**os.environ, "PATH": "/venv/bin"}
 
 
 def test_unreadable_sidecar_is_needs_input(tmp_path: Path) -> None:

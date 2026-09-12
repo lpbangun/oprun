@@ -38,6 +38,14 @@ PENDING, READY, DISPATCHED, COMPLETED, FAILED, BLOCKED = (
 )
 TERMINAL = {COMPLETED, FAILED, BLOCKED}
 
+#: **Display only** — the word a reader sees for a lane that was settled as a non-acceptance
+#: (``settle --needs-review``, or an ``--accept`` the controller refused). It is deliberately NOT
+#: a state: it is absent from :data:`TRANSITIONS` and :data:`TERMINAL`, ``apply`` rejects it as a
+#: from-state, and the lane's stored status stays ``failed`` (fenced, terminal, exactly as before).
+#: The distinction is real: ``failed`` reads as "the mission broke", ``parked`` reads as "waiting
+#: for a decision" — which is what the ledger actually holds.
+PARKED = "parked"
+
 TRANSITIONS: dict[tuple[str, str], str] = {
     (PENDING, "ready"): READY,
     (PENDING, "dispatch"): DISPATCHED,
@@ -47,6 +55,12 @@ TRANSITIONS: dict[tuple[str, str], str] = {
     (DISPATCHED, "failure"): FAILED,
     (DISPATCHED, "block"): BLOCKED,
     (DISPATCHED, "retry"): DISPATCHED,
+    # An INFRA outcome is not a failure, so it cannot be the failure transition: the attempt never
+    # ran the lane's tests at all (the controller's own re-run could not start the command, or its
+    # budget killed it), so nothing about the lane was proven. The lane returns to ``ready`` — the
+    # ordinary dispatch gate re-enters it, and the worker is relaunched by the conductor — while the
+    # failure streak it must never touch stays exactly where it was (issue #1).
+    (DISPATCHED, "infra"): READY,
     (FAILED, "retry"): DISPATCHED,
     (FAILED, "block"): BLOCKED,
     (BLOCKED, "retry"): DISPATCHED,
@@ -57,6 +71,15 @@ TRANSITIONS: dict[tuple[str, str], str] = {
 #: Exact token a caller may grep for when nesting runs too deep (a worker spawning a
 #: worker is a boundary violation, not a retryable failure).
 DEPTH_EXCEEDED_TOKEN = "nested_worker_depth_exceeded"
+
+#: How many **infra** outcomes a lane may accumulate before the ledger parks it for review.
+#: Deliberately NOT the circuit breaker: ``failure_limit`` counts failing *tests*, while an infra
+#: outcome means no test ever ran (the controller's own re-run could not start the command, or its
+#: budget killed it). Nothing about the lane was proven, so the streak stays untouched — but a
+#: permanently unrunnable command must still reach a human instead of being retried forever, and
+#: this cap is how. Two: one retry after the fault is visible, then a park that names the
+#: environment (issue #1).
+DEFAULT_INFRA_LIMIT = 2
 
 #: Separator class ignored by :func:`normalize_model`. Dropped, never replaced with a
 #: space, so "Cursor Grok 4.6" and "cursor-grok-4.6" collapse to the same string.
@@ -85,6 +108,26 @@ def apply(state: str, event: str) -> str:
         return TRANSITIONS[(state, event)]
     except KeyError:
         raise IllegalTransition(f"illegal transition: {state!r} + {event!r}") from None
+
+
+def display_state(lane: dict) -> str:
+    """The word a reader sees for ``lane``: :data:`PARKED` for a settlement parked for review.
+
+    Derived, never stored — the lane's status stays ``failed`` and every fence, transition and
+    terminal-set check keeps working on the real state:
+
+    * settled as a non-acceptance (``needs_review`` verdict: ``settle --needs-review``, or an
+      ``--accept`` the controller refused on identity/evidence) -> ``parked``. The lane is
+      waiting for a decision, not evidence that the mission broke.
+    * anything else -> its own status. A lane ``advance`` failed for its own reasons (red test,
+      unusable artifact) keeps the honest ``failed``, so the two words stay distinct.
+    """
+    status = str((lane or {}).get("status") or "")
+    if status != FAILED:
+        return status
+    evidence = lane.get("evidence")
+    verdict = evidence.get("verdict") if isinstance(evidence, dict) else None
+    return PARKED if verdict == "needs_review" else status
 
 
 def normalize_model(name: str) -> str:
@@ -230,11 +273,15 @@ class Ledger:
     """
 
     def __init__(self, path: str | os.PathLike[str], failure_limit: int = 3,
-                 max_parallel: int = 4, max_depth: int = 1) -> None:
+                 max_parallel: int = 4, max_depth: int = 1,
+                 infra_limit: int = DEFAULT_INFRA_LIMIT) -> None:
         self.path = Path(path)
         self.failure_limit = failure_limit
         self.max_parallel = max_parallel
         self.max_depth = max_depth
+        # The infra cap is a SEPARATE bound from the circuit breaker on purpose: `failure_limit`
+        # counts red tests, `infra_limit` counts attempts whose tests never ran at all.
+        self.infra_limit = infra_limit
         # "<path>.lock" / "<path>.tmp" are *appended* (contract spelling), so two ledgers
         # named state.json and state.json.bak can never end up sharing one lock file.
         self._lock_path = Path(f"{self.path}.lock")
@@ -282,7 +329,8 @@ class Ledger:
     @staticmethod
     def _blank_lane(*, harness: str, worktree: str, test_cmd: list[str],
                     model: str | None, depends_on: list[str] | None,
-                    parent_dispatch: str | None, depth: int) -> dict:
+                    parent_dispatch: str | None, depth: int,
+                    merge_into: str | None = None) -> dict:
         """A complete lane record. Every field is always present on every lane."""
         return {
             "status": PENDING,
@@ -294,6 +342,11 @@ class Ledger:
             "parent_dispatch": parent_dispatch,
             "depth": depth,
             "dispatch_id": None,
+            #: The branch this lane's work is meant to land on, recorded by ``dispatch --into``.
+            #: ``settle --accept`` merges ONLY when the primary worktree has this branch checked
+            #: out; ``None`` means no target was recorded and the legacy behaviour stands (merge
+            #: into whatever the primary worktree happens to have checked out).
+            "merge_into": merge_into,
             #: The commit the lane started from, anchored once at its first dispatch. Evidence
             #: compares HEAD against this to tell "the lane committed its own work" (HEAD moved)
             #: from "the lane is still sitting on the commit it was cut from" (HEAD unchanged, so
@@ -301,6 +354,12 @@ class Ledger:
             "base_commit": None,
             "attempt": 0,
             "consecutive_failures": 0,
+            #: Every **infra** outcome for this lane, in order: ``{dispatch_id, reason, evidence, at}``.
+            #: Infra means the controller's own re-run never ran the lane's tests (the command could
+            #: not be started, or the budget killed it), so none of these is a failed test and none
+            #: of them touches ``consecutive_failures``. The list is also the ledger's bound: at
+            #: ``infra_limit`` entries the lane is parked for review (issue #1).
+            "infra": [],
             "accepted": [],              # dispatch ids whose settlement was accepted
             "rejected": [],              # {dispatch_id, reason, at}
             "evidence": {},
@@ -322,11 +381,18 @@ class Ledger:
 
     def init_lane(self, lane_id: str, *, harness: str, worktree: str, test_cmd: list[str],
                   model: str | None = None, depends_on: list[str] | None = None,
-                  parent_dispatch: str | None = None, depth: int = 0) -> dict:
+                  parent_dispatch: str | None = None, depth: int = 0,
+                  merge_into: str | None = None) -> dict:
         """Create a lane. Idempotent: an existing lane is returned untouched.
 
         Raises :class:`DepthExceeded` when ``depth > max_depth`` — depth is a hard ceiling
         checked at creation, so a nesting bug cannot be discovered halfway through a run.
+
+        ``merge_into`` is the ONE field that is not setdefault-ed: an explicit ``--into`` at
+        dispatch *replaces* the recorded target (a re-dispatch is the conductor re-stating where
+        the work lands), while passing nothing leaves whatever was recorded before. ``None`` means
+        "not recorded", and ``settle --accept`` then merges into whatever the primary worktree has
+        checked out, exactly as before ``--into`` existed.
         """
         if depth > self.max_depth:
             raise DepthExceeded(
@@ -335,12 +401,15 @@ class Ledger:
             )
         record = self._blank_lane(harness=harness, worktree=worktree, test_cmd=test_cmd,
                                   model=model, depends_on=depends_on,
-                                  parent_dispatch=parent_dispatch, depth=depth)
+                                  parent_dispatch=parent_dispatch, depth=depth,
+                                  merge_into=merge_into)
         with self._locked():
             lane = self.data["lanes"].setdefault(lane_id, record)
             # every record carries every field, even one hand-edited outside this module
             for key, value in record.items():
                 lane.setdefault(key, value)
+            if merge_into:
+                lane["merge_into"] = merge_into
             self._write()
             return lane
 
@@ -391,7 +460,7 @@ class Ledger:
             return lane["dispatch_id"]
 
     def settle(self, lane_id: str, dispatch_id: str, ok: bool,
-               evidence: dict | None = None, reason: str = "") -> dict:
+               evidence: dict | None = None, reason: str = "", infra: bool = False) -> dict:
         """Accept or reject one dispatch's outcome, and apply the circuit breaker.
 
         Fencing runs FIRST, before the duplicate check: a superseded dispatch is stale
@@ -404,7 +473,21 @@ class Ledger:
         (never synthesised, and a commit is never invented here — a lane that did not commit
         has no commit). Returns ``{"accepted": True, "status": ..., "consecutive_failures":
         ...}``.
+
+        ``infra=True`` is the one settlement that is **not** an outcome of the lane: the
+        controller's own re-run never ran the lane's ``test_cmd`` (it could not start it, or its
+        budget killed it), so no test was proven either way. Such an attempt is recorded in
+        ``lane["infra"]`` with its evidence, the lane moves ``dispatched -> ready`` so the ordinary
+        dispatch gate can re-enter it, and ``consecutive_failures`` is **left exactly as it was**:
+        the circuit breaker counts red tests, and an ENOENT is not one (issue #1). ``ok=True`` with
+        ``infra=True`` is refused outright — an infra outcome is never an acceptance. At
+        ``infra_limit`` accumulated infra outcomes the lane is parked ``blocked``, with a
+        ``blocked_reason`` naming the environment, so a permanently unrunnable command reaches a
+        human instead of being retried forever; that park touches no failure streak either.
+        Returns that settlement with an extra ``infra_count``.
         """
+        if infra and ok:
+            raise ValueError("infra=True means no test verdict was reached: it cannot accept a lane")
         with self._locked():
             lane = self._lane(lane_id)
 
@@ -427,6 +510,26 @@ class Ledger:
             # the lane must still be mid-flight for a settlement to mean anything
             if lane["status"] != DISPATCHED:
                 return reject(f"lane is {lane['status']!r}, not dispatched")
+
+            if infra:
+                infra_outcomes = lane.setdefault("infra", [])
+                self._move(lane, "infra", READY)
+                infra_outcomes.append({"dispatch_id": dispatch_id, "reason": reason,
+                                       "evidence": dict(evidence) if evidence else {},
+                                       "at": time.time()})
+                if len(infra_outcomes) >= self.infra_limit:
+                    # Parked for a human, and parked by the INFRA cap — never by the breaker, which
+                    # counts failing tests and has just been deliberately left untouched.
+                    self._move(lane, "block", apply(lane["status"], "block"))
+                    lane["blocked_reason"] = (
+                        f"infra: {reason} ({len(infra_outcomes)} infra outcomes; limit "
+                        f"{self.infra_limit}; the lane's tests never ran, so the failure streak "
+                        f"is untouched)"
+                    )
+                self._write()
+                return {"accepted": True, "status": lane["status"],
+                        "consecutive_failures": lane["consecutive_failures"],
+                        "infra_count": len(infra_outcomes)}
 
             self._move(lane, "success" if ok else "failure",
                        COMPLETED if ok else FAILED)

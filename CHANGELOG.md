@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.3 — wake-up discipline and the run proposal
+
+**The bug:** a lane runs under `systemd-run --user`, outside every channel the conductor listens on,
+so nothing announces that it finished — a completed lane sat unnoticed until the user asked. The fix
+is conductor discipline, not a daemon.
+
+- **`SKILL.md` — probe on cadence.** Probe after every other conductor step (`init`, each `dispatch`,
+  each `settle`, every user turn) and wait only in bounded `probe --wait --timeout` loops; `sleep N;
+  probe` is named as the anti-pattern. A new *Wake-up* section documents the two pollable signals —
+  `advance`'s exit summary (`accepted=… all_terminal=… final={…}`) and the sidecar's `finished_at` —
+  with no heartbeat and no timer that dispatches.
+- **`SKILL.md` — infra-127 is the environment, not the lane.** An `infra` verdict means the
+  acceptance command never *started* (rc 127): re-probe with a full PATH, read the sidecar, retry once
+  before parking — never settle it as a lane failure. A genuine red test still parks immediately.
+  Pitfalls and the Verification checklist carry both rules.
+- **`templates/run-proposal.md`** — a run-proposal table (lanes, harness+model, test gate, depends,
+  envelope, caps, flow) so the envelope is approved **once per run**, not per dispatch.
+- **`README.md`** — the quickstart gains the propose-then-init step and a *Wake-up* section; the
+  probe verdict list now includes `infra`.
+
 ## v0.2.2 — routing surface and verification scars
 
 **Routing:** Claude Code is no longer routed. It is gone from the default table, the adapters

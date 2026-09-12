@@ -31,6 +31,12 @@ Three rules are load-bearing:
 4. **Every loop is bounded.** The runner returns when the lanes are decided or when the deadline
    passes. A lane that fails is *parked*, not retried blindly: the ledger's circuit breaker owns
    the failure streak, and a ``blocked`` lane is terminal as far as this process is concerned.
+5. **The environment failing is not the lane failing.** When the acceptance re-run cannot be
+   *started* (the program is not on PATH: ENOENT) or the controller's own budget kills it, no test
+   was proven red. That outcome is recorded as ``infra``, the lane goes back to ``ready`` and its
+   failure streak is left untouched — an ENOENT must never park a lane or strike the breaker
+   (issue #1). The ledger caps how many infra outcomes a lane may accumulate, so a permanently
+   unresolvable command still reaches a human.
 
 No model is involved anywhere here: no LLM imports, no harness subprocess. The only subprocesses
 are the lane's own ``test_cmd`` and read-only ``systemctl``/``git`` queries.
@@ -46,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -56,7 +63,7 @@ from typing import Callable, NamedTuple
 # The ONE git-evidence builder lives in the ledger, next to the lane records whose ``base_commit``
 # anchor it needs: this module used to carry its own copy, and that copy named the worktree's HEAD
 # (the shared base SHA, for a lane that never committed) as the lane's ``commit``.
-from ledger import TERMINAL, Ledger, git_evidence
+from ledger import BLOCKED, TERMINAL, Ledger, git_evidence
 
 import launch  # sibling module: the only detach/lifetime authority (scripts/launch.py)
 # The identity rule — did this lane run the model and harness the ledger designated? — lives with
@@ -91,10 +98,51 @@ TEST_TIMEOUT = 300.0
 #: Characters of test output kept as evidence (the tail is where failures are named).
 TEST_TAIL = 2000
 
-#: Verdicts a lane can carry, matching ``probe``'s vocabulary.
-DONE, PENDING, NEEDS_INPUT, STALLED, FAILED_VERDICT = (
-    "done", "pending", "needs_input", "stalled", "failed",
+#: Verdicts a lane can carry, matching ``probe``'s vocabulary. ``INFRA`` is the environment's
+#: failure, not the lane's: the acceptance command could not be RUN (ENOENT/timeout), so no test
+#: was proven red and nothing about it may count as a lane failure (issue #1).
+DONE, PENDING, NEEDS_INPUT, STALLED, FAILED_VERDICT, INFRA = (
+    "done", "pending", "needs_input", "stalled", "failed", "infra",
 )
+
+#: Acceptance re-runs the runner retries **in place** when the command could not be run at all.
+#: Bounded on purpose: an environment that cannot start the command will not start it on the third
+#: try either, and the dead attempts cost a mission nothing but a fraction of a second.
+INFRA_RUN_RETRIES = 2
+
+#: Seconds between those in-place re-runs.
+INFRA_RETRY_BACKOFF = 0.25
+
+#: The lane field recording the PATH the lane's worker unit was launched with (written at
+#: dispatch from ``launch()``'s own report). Read from the lane dict handed to the runner, never
+#: derived: an absent/blank value means "not recorded" and the acceptance re-run then inherits the
+#: ambient environment exactly as it did before the field existed. Spelled identically in
+#: ``probe.py``; the suite asserts both modules agree, so the two re-run sites can never drift.
+UNIT_PATH_FIELD = "unit_path"
+
+#: The one environment variable the re-run overrides. Nothing is resolved from it, ever.
+PATH_ENV = "PATH"
+
+
+def _test_cmd_env(unit_path: str | None) -> dict[str, str] | None:
+    """The environment a lane's ``test_cmd`` is re-run under — ``None`` means "inherit ours".
+
+    ``launch.py`` pins a PATH onto every worker unit, and the launcher's own report of it is
+    recorded on the lane at dispatch (``unit_path``). The acceptance re-run must happen under that
+    same PATH, or the worker and the controller run the lane's ``test_cmd`` under two different
+    PATHs by construction — "the test the worker passed" need not be the test the controller can
+    run. With a recorded PATH the command runs with a copy of the current environment whose
+    ``PATH`` is exactly that value; with none, ``None`` is returned so the child inherits the
+    ambient environment (every ledger written before the field keeps working unchanged).
+
+    Deliberately nothing else: no ``shutil.which``, no resolution, no heuristic, no default
+    entries. Twin of ``probe._test_cmd_env`` — ``advance`` must run with or without ``probe.py``,
+    so the rule lives in both and each reads the same lane field.
+    """
+    recorded = str(unit_path or "").strip()
+    if not recorded:
+        return None
+    return {**os.environ, PATH_ENV: recorded}
 
 
 class _Decision(NamedTuple):
@@ -333,25 +381,36 @@ def _unit_lifetime(lane_id: str) -> str:
 # --- controller evidence -----------------------------------------------------
 
 
-def _run_test(lane: dict, worktree: Path, deadline: float) -> tuple[int, str, str]:
-    """Re-run the lane's OWN ``test_cmd`` in its worktree. Returns ``(exit_code, tail, note)``.
+def _run_test(lane: dict, worktree: Path, deadline: float) -> tuple[int, str, str, str]:
+    """Re-run the lane's OWN ``test_cmd`` in its worktree.
+
+    Returns ``(exit_code, tail, note, infra_reason)``. ``infra_reason`` is non-empty **only** when
+    the command never reached a verdict of its own — the controller could not start it
+    (ENOENT/OSError/ValueError) or its own budget ran out. That is an environment fault, so the
+    caller must never count it as a failing test (issue #1: rc 127 was settled as a lane failure and
+    struck the circuit breaker).
 
     The command and the working directory come from the ledger, never from the worker: a lane
-    can neither choose nor skip the test that decides its own acceptance.
+    can neither choose nor skip the test that decides its own acceptance. The **environment** is
+    the lane's own recorded launch PATH when it has one (:func:`_test_cmd_env`), so the re-run
+    reproduces the PATH the worker ran under instead of the runner's.
     """
     cmd = [str(part) for part in (lane.get("test_cmd") or [])]
     if not cmd:
-        return 1, "", "lane has no test_cmd, so nothing can be re-run to accept it"
+        return 1, "", "lane has no test_cmd, so nothing can be re-run to accept it", ""
     budget = min(TEST_TIMEOUT, max(1.0, deadline - time.monotonic()))
     try:
         proc = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
-                              timeout=budget)
+                              timeout=budget,
+                              env=_test_cmd_env(lane.get(UNIT_PATH_FIELD)))
     except subprocess.TimeoutExpired:
-        return 124, "", f"test command exceeded {budget:.0f}s"
+        why = f"test command exceeded {budget:.0f}s"
+        return 124, "", why, why
     except OSError as exc:
-        return 127, "", f"test command could not run: {exc}"
+        why = f"test command could not run: {exc}"
+        return 127, "", why, why
     tail = ((proc.stdout or "") + (proc.stderr or ""))[-TEST_TAIL:]
-    return proc.returncode, tail, f"exited {proc.returncode}"
+    return proc.returncode, tail, f"exited {proc.returncode}", ""
 
 
 def _utc_now() -> str:
@@ -430,6 +489,60 @@ def _settle_no_evidence(led: Ledger, lane_id: str, dispatch_id: str, *, lifetime
                         verdict=verdict, witness=witness)
 
 
+def _settle_infra(led: Ledger, lane_id: str, dispatch_id: str, reason: str,
+                  emit: Callable[[str], None], *, verdict: dict | None = None,
+                  witness: dict | None = None, exit_code: int | None = None,
+                  tail: str = "", retries: int = 0) -> _Decision | None:
+    """Record an ``infra`` outcome: the controller could not RUN the lane's acceptance command.
+
+    This is the *environment* failing, not the lane: the command was never started (ENOENT, not
+    executable) or the controller's own budget killed it, so no test was proven red. The ledger
+    therefore records the attempt in ``lane["infra"]`` and puts the lane back in ``ready`` —
+    dispatchable again through the ordinary gate, with ``consecutive_failures`` **untouched** —
+    instead of settling a failure that would park the lane and strike the circuit breaker (issue #1).
+
+    The bound lives in the ledger (``infra_limit``): once a lane has accumulated that many infra
+    outcomes it is parked ``blocked`` with a ``blocked_reason`` naming the environment, so a
+    permanently unresolvable command surfaces to a human instead of being retried forever.
+
+    Returns ``None`` when the lane was simply put back in ``ready`` — nothing is decided: it is no
+    longer in flight, so the caller must not report it as accepted, parked or timed out, and the
+    conductor's next ``dispatch`` is what relaunches the worker.
+    """
+    lane = led.lane(lane_id)
+    evidence = {
+        "controller": "advance",
+        "dispatch_id": dispatch_id,
+        "verdict": INFRA,
+        "outcome": "infra",
+        "rejected_because": reason,
+        "sidecar": (verdict or {}).get("evidence", {}).get("sidecar"),
+        "test_exit_code": exit_code,
+        "test_output_tail": tail,
+        "test_reruns": retries,
+        "harness": lane.get("harness"),
+        "model_requested": lane.get("model_requested"),
+        "witness": witness,
+        "checked_at": _utc_now(),
+        "note": ("the acceptance command never ran to a verdict of its own: the environment failed, "
+                 "so this is not a red test and the failure streak is untouched"),
+    }
+    result = led.settle(lane_id, dispatch_id, False, evidence=evidence, reason=reason, infra=True)
+    if not result.get("accepted"):
+        emit(f"[{lane_id}] SETTLE_REFUSED {result.get('reason')}")
+        return _Decision(lane_id, "parked", "infra",
+                         f"ledger refused the settlement: {result.get('reason')}")
+    count = result.get("infra_count")
+    if result.get("status") == BLOCKED:
+        emit(f"[{lane_id}] NEEDS_REVIEW infra exit={exit_code} {reason} "
+             f"(infra limit reached after {count} infra outcomes; failure streak untouched)")
+        return _Decision(lane_id, "parked", "infra", reason)
+    suffix = f" exit={exit_code}" if exit_code is not None else ""
+    emit(f"[{lane_id}] INFRA_RETRY{suffix} {reason} (infra {count}/{led.infra_limit}; lane back to "
+         f"ready for re-dispatch, failure streak untouched)")
+    return None
+
+
 def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
                   emit: Callable[[str], None]) -> _Decision | None:
     """Decide one DISPATCHED lane, or return ``None`` when there is nothing to decide yet."""
@@ -463,7 +576,21 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
 
     # Evidence is complete. The controller now re-runs the lane's OWN test command: the sidecar
     # says the worker believes it succeeded, this says it actually did.
-    exit_code, tail, note = _run_test(lane, worktree, deadline)
+    exit_code, tail, note, infra_reason = _run_test(lane, worktree, deadline)
+    retries = 0
+    while infra_reason and retries < INFRA_RUN_RETRIES and time.monotonic() < deadline:
+        # The command never ran at all. That is the environment's fault, not the lane's tests, so it
+        # is retried in place a BOUNDED number of times before it is recorded as ``infra`` rather
+        # than settled as a failure (issue #1). A permanent fault (a program that is not installed)
+        # survives the retry, which is exactly why the retry is bounded and why the ledger caps how
+        # many infra outcomes a lane may accumulate.
+        retries += 1
+        time.sleep(min(INFRA_RETRY_BACKOFF, max(0.0, deadline - time.monotonic())))
+        emit(f"[{lane_id}] INFRA_RETRY attempt={retries}/{INFRA_RUN_RETRIES} {infra_reason}")
+        exit_code, tail, note, infra_reason = _run_test(lane, worktree, deadline)
+    if infra_reason:
+        return _settle_infra(led, lane_id, dispatch_id, infra_reason, emit, verdict=verdict,
+                             witness=witness, exit_code=exit_code, tail=tail, retries=retries)
     if exit_code != 0:
         return _settle_park(led, lane_id, dispatch_id, "test_failure",
                             f"controller test re-run failed: {note}", emit,
@@ -483,6 +610,10 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         # accepted lane can still carry a disagreeing harness self-report.
         "identity_warning": str(verdict["evidence"].get("identity_warning") or ""),
         "test_cmd": [str(part) for part in (lane.get("test_cmd") or [])],
+        # What the acceptance re-run ran under: the lane's recorded launch PATH, or ``None`` when
+        # the lane has none and the runner's ambient environment was inherited. Recorded so a
+        # reader can tell which environment a passing re-run actually saw.
+        "unit_path": str(lane.get(UNIT_PATH_FIELD) or "").strip() or None,
         "test_exit_code": exit_code,
         "test_result": "pass",
         "test_output_tail": tail,
@@ -536,9 +667,18 @@ def advance(ledger_path: Path | str, *, timeout: int = 600, poll: float = 2.0,
     therefore say *why* a lane ran out of clock; a settled lane appears there and in
     ``needs_review`` both.
 
-    Retrying is deliberately absent. A lane that fails is parked; the ledger's circuit breaker
-    owns the failure streak, and re-dispatching a genuinely broken lane is a conductor decision
-    ("a lane that fails parks at blocked/needs_review rather than being retried blindly").
+    Retrying a *failure* is deliberately absent: a lane that fails its own tests is parked, the
+    ledger's circuit breaker owns the failure streak, and re-dispatching a genuinely broken lane is
+    a conductor decision ("a lane that fails parks at blocked/needs_review rather than being retried
+    blindly").
+
+    The one retry this runner owns is the **infra** one, because it is not a lane failure at all:
+    when the acceptance command cannot be *started* (ENOENT) or the controller's budget kills it, the
+    re-run is retried in place a bounded number of times (``INFRA_RUN_RETRIES``) and the outcome is
+    then recorded as ``infra`` — the lane returns to ``ready`` (re-dispatchable through the ordinary
+    gate, which is what relaunches its worker) with ``consecutive_failures`` untouched. After
+    ``Ledger.infra_limit`` infra outcomes the ledger parks the lane ``blocked``, naming the
+    environment in ``blocked_reason``, so a permanently unrunnable command still reaches a human.
     """
     path = Path(ledger_path)
     led = Ledger(path)

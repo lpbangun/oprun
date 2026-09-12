@@ -459,3 +459,68 @@ def test_dispatch_uses_launch_launch_and_never_a_shell_background() -> None:
     assert "Popen" not in source, "the detach story is launch.launch(), not a shell job"
     assert "shell=True" not in source
     assert shutil.which("systemd-run") is not None
+
+
+def test_dispatch_records_the_path_the_unit_was_launched_with(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dispatch-time half of PATH parity: ``launch()``'s OWN report lands on the lane.
+
+    The launcher pins a PATH onto the worker unit and returns it; the lane has to carry it, because
+    the controller's acceptance re-run (``probe``/``advance``) reads the lane, not the launcher. The
+    value asserted here is the one ``launch()`` reported — never a recomputed one — and no worker is
+    really started: ``launch.launch`` is replaced, so nothing depends on a live systemd session.
+    """
+    import oprun
+
+    fixture = init_mission(tmp_path)
+    worktree = fixture["repo"] / "wt"
+    worktree.mkdir()
+    recorded = "/opt/lane-tools:/usr/bin:/bin"
+    monkeypatch.setattr(oprun.launch, "launch",
+                        lambda unit, argv, **kwargs: {"unit": unit, "started": True,
+                                                      "detail": "started", "path": recorded})
+    monkeypatch.setattr(oprun, "_resolve_binary", lambda _name: "/bin/true")
+
+    code = oprun.main(["dispatch", "alpha", "--ledger", str(fixture["ledger"]),
+                       "--harness", "cursor-agent", "--worktree", str(worktree),
+                       "--test-cmd", f"{sys.executable} -c pass", "--prompt", "do the thing"])
+
+    assert code == 0
+    lane = read_ledger(fixture["ledger"])["lanes"]["alpha"]
+    assert lane["status"] == "dispatched"
+    assert lane[oprun.UNIT_PATH_FIELD] == recorded
+
+
+def test_the_recorded_path_field_is_one_contract() -> None:
+    """Three modules, one field: dispatch writes it, both re-run sites read it — no drift."""
+    import advance
+    import oprun
+
+    assert oprun.UNIT_PATH_FIELD == "unit_path"
+    assert probe_mod.UNIT_PATH_FIELD == oprun.UNIT_PATH_FIELD
+    assert advance.UNIT_PATH_FIELD == oprun.UNIT_PATH_FIELD
+    assert probe_mod.PATH_ENV == advance.PATH_ENV == "PATH"
+
+
+def test_settle_accept_reruns_the_lane_test_under_the_recorded_path(tmp_path: Path) -> None:
+    """The CLI's OWN re-run (``settle --accept``) follows the same PATH rule as probe/advance.
+
+    Three modules perform the controller's re-run; a rule fixed in two of them is the bug that
+    survives the fix. Here the bare tool resolves only because the recorded PATH is passed, and the
+    first assertion is the control: on the ambient PATH the very same command cannot be started.
+    """
+    import oprun
+
+    tool_dir = tmp_path / "lane-tools"
+    tool_dir.mkdir()
+    tool = tool_dir / "oprun-path-parity-tool"
+    tool.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(0)\n", encoding="utf-8")
+    tool.chmod(0o755)
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    ambient_rc, _tail = oprun._run_test_cmd(["oprun-path-parity-tool"], worktree)
+    assert ambient_rc == 127, "the control: the ambient PATH has no such program"
+
+    recorded_rc, _tail = oprun._run_test_cmd(["oprun-path-parity-tool"], worktree, str(tool_dir))
+    assert recorded_rc == 0, "the lane's recorded PATH must be what the re-run uses"

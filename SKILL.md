@@ -1,7 +1,7 @@
 ---
 name: oprun
 description: Use when a long-horizon software mission runs via oprun.
-version: 0.2.2
+version: 0.2.3
 author: Logani Bangun (lpbangun), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -106,7 +106,9 @@ systemd-run --user --unit oprun-advance --collect -- \
 
 1. **Intake, nothing launched.** Read the repo, the request, and any existing ledger. Five-line
    plan: objective, repo, lane→harness (from `references/routing.md`), worktree per lane, and the
-   envelope you will ask for. Wait for the user's go-ahead if they did not already give it.
+   envelope you will ask for — written out as a run proposal (`templates/run-proposal.md`) so the
+   user approves the **run** once, not each dispatch. Wait for the user's go-ahead if they did not
+   already give it.
 2. **`init` once**, with the envelope and caps: `--approve …`, `--max-parallel N`,
    `--failure-limit N`. Completion: the ledger parses and `status` prints the intended envelope.
 3. **Write lanes coarse and complete.** One dispatch = one whole bounded unit, testable by a
@@ -114,12 +116,59 @@ systemd-run --user --unit oprun-advance --collect -- \
    are lid-safe, a chain needs turns.
 4. **Dispatch.** Never edit the lane's product files yourself. A worker only ever writes its
    sidecar; the ledger is written by the conductor.
-5. **Probe, then settle.** Accept only on `probe`'s `done`. `needs_input`/`stalled` → look at the
-   evidence and decide; `failed` → the ledger parked it. Never settle a lane you have not probed.
+5. **Probe, then settle — on cadence.** Accept only on `probe`'s `done`. `needs_input`/`stalled` →
+   look at the evidence and decide; `failed` → the ledger parked it. Never settle a lane you have
+   not probed. Probe after **every** other conductor step and after every user turn — see
+   *Wake-up* below; an `infra` verdict is debugged, not parked.
 6. **Gates.** `needs_review`, a `blocked` lane, scope change, or anything outside the envelope:
    one line to the user, then wait. Everything inside the envelope: act, do not re-litigate.
 7. **Finish.** `status` must show `nextAction: none` and every owned unit gone
    (`systemctl --user list-units 'oprun-*'`).
+
+## Wake-up: how a finished lane is noticed
+
+A lane runs under `systemd-run --user`, **outside every channel this chat listens on**. Nothing pings
+the conductor when a worker exits: a finished lane sits there, sidecar and all, until someone asks —
+which is exactly how a run stalls unnoticed. The fix is discipline, not a daemon: **probe on
+cadence.**
+
+1. **Probe after every other conductor step.** After `init`, after each `dispatch`, after each
+   `settle`, after any user turn inside the run, and before you answer the user, run `probe <lane>`
+   for every lane the ledger holds. The verdict is one deterministic word
+   (`done|infra|pending|needs_input|stalled|failed`) — cheap enough to spend, and the only thing that
+   speaks for a lane. `status`, `systemctl` and pane text are context, never the verdict. Probing an
+   already-`done` lane is free, so cost is never a reason not to look.
+2. **Wait bounded, never open.** `probe <lane> --wait --timeout 900` polls until the verdict is no
+   longer `pending`, then returns; `--timeout` is the budget, and `pending` at the deadline means
+   *not yet*, not *never*. Loop it in bounded turns instead of holding a turn open. `sleep 600;
+   probe` is the anti-pattern this rule exists to prevent: it neither proves progress nor notices it
+   early.
+3. **The completion hook is opt-in, and there is no daemon behind it.** No heartbeat, no timer that
+   dispatches, no resident poller. Two artifacts carry the signal, and the conductor reads them on
+   its own cadence:
+   - **`advance`'s exit summary** — its last line is
+     `oprun-advance: accepted=… needs_review=… stalled=… timed_out=… all_terminal=… final={…}`
+     (`--json` puts that object on stdout, one line per lane on stderr). A *returned* `advance` is
+     itself the poll: the counts and `all_terminal` say what settled and what stayed parked.
+     Launch it detached **once** next to the lanes; do not re-launch it on a timer.
+   - **the sidecar's `finished_at`** — every worker stamps its own sidecar with ISO-8601 UTC when it
+     stops, so `<worktree>/.oprun/result.<dispatch_id>.json` appearing with a `finished_at`, for the
+     ledger's **current** `dispatch_id`, is the coarse "something ended" signal the conductor polls
+     when it has no other reason to look. It is not acceptance: `finished_at` says the worker
+     *stopped*; `probe` says whether the lane is *done*.
+
+**infra-127: debug, do not park.** An `infra` verdict — rc 127, or the acceptance command never
+started — means the **environment** failed, not the lane; no test was proven red, so it must never be
+settled as a failure or charged to the circuit breaker.
+
+- **Re-probe with a full `PATH`.** A unit gets no login shell and can inherit a bare PATH; 127
+  usually means the program (or a venv `bin`) was not resolvable under the unit's PATH. Probe from a
+  login shell, or re-dispatch with the lane's `env` PATH pinned.
+- **Read the sidecar.** If a valid sidecar exists for the current dispatch, the worker did its job
+  and the failure is in the controller's own re-run — fix that, do not blame the lane.
+- **Retry before parking.** One bounded manual retry, then let `advance` do its own bounded
+  `INFRA_RETRY` up to the ledger's `infra_limit`. A **genuine** red test still parks immediately: a
+  non-zero rc with no `infra_reason` is the lane failing, and that never gets a free retry.
 
 ## Pitfalls
 
@@ -143,6 +192,13 @@ systemd-run --user --unit oprun-advance --collect -- \
 - **Assuming a fix reached every call site.** When a helper exists twice, the fix lands in one copy and
   the other keeps the bug — especially when the stale copy lives in a module that never imports the
   fixed one. `grep` the **function name**, not just its call sites.
+- **Waiting open, or never looking.** A finished lane is invisible until someone probes it, and
+  `sleep N; probe` is neither a wait nor a check. Probe after every step; use `--wait --timeout` for
+  a bounded wait. The bug this encodes is a lane that finished and sat unnoticed until the user
+  asked.
+- **Settling an `infra` verdict as if the lane failed.** rc 127 means the environment could not
+  *start* the acceptance command — re-probe with a full PATH, read the sidecar, retry once before
+  parking. A genuine red test (non-zero rc, no `infra_reason`) still parks immediately.
 - **`git add -A` on a lane's worktree.** `.oprun/` sidecars and `__pycache__/` are lane evidence, not
   product. Stage explicit paths when integrating a lane's work, or the sidecar dir ships.
 
@@ -154,6 +210,12 @@ systemd-run --user --unit oprun-advance --collect -- \
 - [ ] **Evidence fields were asserted, not just the exit code** — in particular no lane's `commit` is
       the base SHA, and uncommitted lanes carry content hashes instead.
 - [ ] No test or check was weakened to go green.
+- [ ] **The conductor probed on cadence** — after every step and every user turn — and every wait was
+      bounded (`probe --wait --timeout`), not an open sleep. No lane finished unnoticed.
+- [ ] Any `infra` (rc 127) verdict was debugged — full PATH, sidecar read, bounded retry — and never
+      settled as a lane failure; genuine red tests parked at once.
+- [ ] The run was approved once against the proposal (`templates/run-proposal.md`); no per-dispatch
+      approval prompt was invented.
 - [ ] Every git side effect stayed inside the recorded envelope; refusals named the missing grant.
 - [ ] Integration staged explicit paths; no `.oprun/` or `__pycache__/` in the product tree.
 - [ ] `status` ends at `nextAction: none` with zero live owned units.

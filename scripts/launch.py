@@ -19,18 +19,40 @@ What this module answers, and what it does not:
 
 * **Process lifetime** — :func:`launch` starts a unit, :func:`unit_status` reads what systemd
   says about it, :func:`stop` tears it down.
+* **The unit's environment** — :func:`build_systemd_run_argv` pins ``HOME`` (the real one, always)
+  and ``PATH`` (:func:`worker_path`): a unit gets no login shell, so an unpinned PATH is exactly
+  where a bare-``npx`` lane died ENOENT and got read as a red test (issue #1).
 * It never answers *whether a lane is done*. A dead unit with valid evidence is a finished
   lane; a live unit with no evidence is not. Only the sidecar plus a controller re-run settles
   a lane (see ``scripts/advance.py``).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 #: The real user home. The launcher itself may run inside a sandbox with a redirected HOME;
 #: workers must not inherit that, so HOME is pinned explicitly on every launch.
 REAL_HOME = "/home/logani"
+
+#: Spelled once: the argv builder, the pinned-PATH resolver and the launch result all key off it.
+PATH_ENV = "PATH"
+
+#: Directory entries appended to the conductor's own PATH for every unit. A systemd user unit is
+#: started without a login shell, so it inherits a *bare* PATH (``/usr/bin:/bin`` at best) — a lane
+#: whose ``test_cmd`` names its tool by the bare name (``npx``, ``node``, ``npm``) then dies ENOENT,
+#: which the controller used to read as a red test (issue #1). The conductor's own entries keep
+#: their precedence because these are APPENDED, never prepended, and the list doubles as the
+#: guarantee that the pinned PATH can never be empty.
+SYSTEM_PATH_ENTRIES = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
 
 #: One unit per lane, so ``systemctl --user show oprun-alpha`` answers for that lane alone.
 UNIT_PREFIX = "oprun-"
@@ -94,6 +116,32 @@ def unit_known(unit: str) -> bool:
     return _property(unit, "LoadState") == "loaded" or bool(_property(unit, "FragmentPath"))
 
 
+def worker_path(env: dict[str, str] | None = None) -> str:
+    """The PATH pinned onto a worker unit: the conductor's resolved PATH plus the system entries.
+
+    Resolution order, deliberately one rule:
+
+    * ``env["PATH"]``, when a caller explicitly sets a non-empty one — a lane that needs a venv's
+      ``bin`` (or a narrower PATH) says so, and gets exactly what it asked for. This is the ONE
+      place a caller may override the pin: unlike HOME, where inheriting a sandboxed value is
+      always a routing bug and never a preference, a PATH is a legitimate per-lane input.
+    * otherwise the conductor's own resolved PATH (every entry, in its own order, so a tool the
+      conductor resolved keeps winning) with :data:`SYSTEM_PATH_ENTRIES` appended.
+
+    Pure: reads the environment, spawns nothing, so the exact string a unit will run with is
+    reviewable and testable without a live session. Never returns ``""`` — an empty PATH *is* the
+    ENOENT failure mode this exists to remove.
+    """
+    override = str((env or {}).get(PATH_ENV) or "").strip()
+    if override:
+        return override
+    entries = [entry for entry in (os.environ.get(PATH_ENV) or "").split(os.pathsep) if entry]
+    for entry in SYSTEM_PATH_ENTRIES:
+        if entry not in entries:
+            entries.append(entry)
+    return os.pathsep.join(entries)
+
+
 def build_systemd_run_argv(unit: str, argv: list[str], workdir: Path,
                            env: dict[str, str] | None = None) -> list[str]:
     """The exact argv that starts ``argv`` as the detached transient unit ``unit``.
@@ -101,6 +149,8 @@ def build_systemd_run_argv(unit: str, argv: list[str], workdir: Path,
     Pure: nothing is spawned, so the detach story is unit-testable and reviewable without a
     live user session. ``HOME`` is always set from :data:`REAL_HOME` and cannot be overridden
     through ``env`` — a worker inheriting a sandboxed HOME is a routing bug, not a preference.
+    ``PATH`` is always pinned too (see :func:`worker_path`), because a bare PATH inside the unit
+    is what turned a resolvable ``npx`` into a 127 the controller read as a failed test.
     """
     if not str(unit).strip():
         raise ValueError("unit name must be a non-empty string")
@@ -113,9 +163,10 @@ def build_systemd_run_argv(unit: str, argv: list[str], workdir: Path,
         f"--unit={unit}",
         f"--working-directory={workdir}",
         f"--setenv=HOME={REAL_HOME}",
+        f"--setenv={PATH_ENV}={worker_path(env)}",
     ]
     for key, value in (env or {}).items():
-        if str(key) == "HOME":
+        if str(key) in ("HOME", PATH_ENV):
             continue
         built.append(f"--setenv={key}={value}")
     built.append("--")
@@ -126,26 +177,32 @@ def build_systemd_run_argv(unit: str, argv: list[str], workdir: Path,
 def launch(unit: str, argv: list[str], *, workdir: Path, env: dict | None = None) -> dict:
     """Start ``argv`` as a DETACHED transient user unit named ``unit``.
 
-    Returns ``{"unit": str, "started": bool, "detail": str}``. ``started`` is systemd-run's
-    own exit status, not an inference: a launcher that reports success it did not observe is
-    worse than one that reports nothing.
+    Returns ``{"unit": str, "started": bool, "detail": str, "path": str}``. ``started`` is
+    systemd-run's own exit status, not an inference: a launcher that reports success it did not
+    observe is worse than one that reports nothing. ``path`` is the PATH the unit was pinned with
+    (:func:`worker_path`), reported so a caller can record what a worker actually ran under.
     """
     workdir = Path(workdir)
     if not workdir.is_dir():
-        return {"unit": unit, "started": False, "detail": f"working directory not found: {workdir}"}
+        return {"unit": unit, "started": False, "detail": f"working directory not found: {workdir}",
+                "path": worker_path(env)}
     built = build_systemd_run_argv(unit, argv, workdir, env)
     try:
         proc = subprocess.run(built, capture_output=True, text=True, timeout=_LAUNCH_TIMEOUT)
     except FileNotFoundError:
-        return {"unit": unit, "started": False, "detail": "systemd-run is not available on this host"}
+        return {"unit": unit, "started": False, "detail": "systemd-run is not available on this host",
+                "path": worker_path(env)}
     except subprocess.TimeoutExpired:
         return {"unit": unit, "started": False,
-                "detail": f"systemd-run did not return within {_LAUNCH_TIMEOUT:g}s"}
+                "detail": f"systemd-run did not return within {_LAUNCH_TIMEOUT:g}s",
+                "path": worker_path(env)}
     except OSError as exc:
-        return {"unit": unit, "started": False, "detail": f"systemd-run could not run: {exc}"}
+        return {"unit": unit, "started": False, "detail": f"systemd-run could not run: {exc}",
+                "path": worker_path(env)}
     detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
     detail = detail[:_DETAIL_LIMIT] if detail else f"systemd-run exited {proc.returncode}"
-    return {"unit": unit, "started": proc.returncode == 0, "detail": detail}
+    return {"unit": unit, "started": proc.returncode == 0, "detail": detail,
+            "path": worker_path(env)}
 
 
 def unit_status(unit: str) -> dict:

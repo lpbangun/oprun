@@ -20,7 +20,12 @@ Copy-paste. `$CLI` is the only entrypoint; everything else is a file.
 ```bash
 CLI="$HOME/projects/oprun/scripts/oprun.py"     # or a checkout's ./scripts/oprun.py
 
-# 1. init — create the ledger + mission dir and pre-approve the envelope. Launches nothing.
+# 0. propose — fill templates/run-proposal.md (lanes, harness+model, test gate, depends, envelope,
+#    caps, flow) and get ONE approval for the whole run. No per-dispatch prompts after this.
+python3 "$CLI" init ...
+
+# 1. init — create the ledger + mission dir and pre-approve the envelope the proposal names.
+#    Launches nothing.
 python3 "$CLI" init "$PWD" --mission "ship the parser rewrite" --approve commit,push,merge
 
 # 2. dispatch — register + launch ONE lane detached. Prints the dispatch_id.
@@ -31,9 +36,10 @@ python3 "$CLI" dispatch parser \
   --test-cmd "python3 -m pytest tests/test_parser.py -q" \
   --prompt "Rewrite the tokenizer. Keep the public API. Do not touch tests/."
 
-# 3. probe — one deterministic verdict word: no model involved.
+# 3. probe — one deterministic verdict word: no model involved. Probe after EVERY step (init,
+#    dispatch, settle, any user turn); a finished lane is invisible until someone looks.
 python3 "$CLI" probe parser --wait --timeout 900
-#   done | pending | needs_input | stalled | failed        (--json for the full document)
+#   done | infra | pending | needs_input | stalled | failed        (--json for the full document)
 
 # 4. settle — accept on evidence; commit/push/merge only inside the envelope.
 python3 "$CLI" settle parser --accept
@@ -60,7 +66,9 @@ example: `templates/state.json`.
 
 ## Approval envelope
 
-Decided once, at `init`, and then acted on without asking:
+Approved **once per run**, from a proposal (`templates/run-proposal.md`: lanes, harness+model, test
+gate, depends, envelope, caps, flow) — not once per dispatch. Decided at `init` and then acted on
+without asking:
 
 ```jsonc
 "approvals": {
@@ -107,6 +115,23 @@ dispatched lane keeps running and still writes its sidecar. What does **not** ha
 away is *advancing*: nothing settles a lane or dispatches the next one. That is exactly what
 `advance` is for — a bounded process you launch detached next to the lanes. Details:
 `references/hosting.md`.
+
+## Wake-up: nothing pings you
+
+A lane lives outside every channel this chat listens on, so a finished lane sits there until someone
+looks — which is how a completed lane goes unnoticed. The answer is **probe on cadence**, not a
+daemon:
+
+- **Probe after every other step** — `init`, each `dispatch`, each `settle`, any user turn. `probe`
+  is one deterministic word, and it costs nothing on an already-`done` lane.
+- **Wait bounded.** `probe <lane> --wait --timeout 900` returns when the verdict leaves `pending`.
+  Loop that; never `sleep 600; probe`, which neither proves progress nor notices it early.
+- **Two pollable signals, no heartbeat.** `advance`'s final line
+  (`accepted=… needs_review=… stalled=… timed_out=… all_terminal=… final={…}`, or `--json` on
+  stdout) says what a bounded run settled and what stayed parked; a sidecar's `finished_at` says a
+  worker stopped. Neither is acceptance — `probe` is.
+- **`infra` (rc 127) is the environment, not the lane.** Re-probe with a full PATH, read the sidecar,
+  retry once before parking; a genuine red test still parks immediately. Details in `SKILL.md`.
 
 ## Routing and tests
 

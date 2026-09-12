@@ -62,11 +62,13 @@ from ledger import (  # noqa: E402  (sibling: the only lane-status authority)
     COMPLETED,
     DISPATCHED,
     FAILED,
+    PARKED,
     PENDING,
     DepthExceeded,
     IllegalTransition,
     Ledger,
     ParallelismExceeded,
+    display_state,
     git_evidence,
 )
 
@@ -88,6 +90,23 @@ MISSION_STATE = "state.json"
 #: ``<repo>/.oprun`` is also the sidecar directory every lane writes into.
 SIDECAR_DIRNAME = ".oprun"
 SIDECAR_TEMPLATE = "result.{dispatch_id}.json"
+
+#: The lane field recording the PATH the lane's worker unit was launched with. Written here at
+#: dispatch from ``launch()``'s own report (``result["path"]``), and read by every acceptance
+#: re-run site — ``probe._run_test_cmd``, ``advance._run_test`` and this module's own
+#: ``_run_test_cmd`` (``settle --accept``) — so a lane's ``test_cmd`` runs under the environment its
+#: worker actually had. Spelled identically in those modules; the suite pins them to one string so
+#: the contract cannot drift.
+UNIT_PATH_FIELD = "unit_path"
+
+#: Paths that are **lane evidence, never product**: the sidecar directory, byte-code caches, and
+#: compiled artefacts. This is the same rule set the repo's own ``.gitignore`` commits, but it is
+#: enforced here as well, because the lane worktree belongs to the *mission* repo — which may have
+#: no ignore rule at all — and ``git add -A`` there shipped ``.oprun/result.<dispatch>.json`` inside
+#: the product commit. A name matching any path component is excluded, and ``*.pyc`` matches by
+#: suffix, so a nested ``pkg/__pycache__/mod.cpython-312.pyc`` is excluded too.
+EVIDENCE_DIRNAMES = (SIDECAR_DIRNAME, "__pycache__", ".pytest_cache")
+EVIDENCE_SUFFIXES = (".pyc",)
 
 #: Accepted spellings that unambiguously mean one registry id. The *ledger* always records the
 #: canonical id, so two spellings can never split a harness's identity. The table itself lives with
@@ -167,6 +186,29 @@ def _update_document(path: Path, mutate: Callable[[dict], None]) -> dict:
         mutate(led.data)
         led._write()  # noqa: SLF001 - and its file format
     return led.data
+
+
+def _record_unit_path(ledger_path: Path, lane_id: str, unit_path: str) -> None:
+    """Persist the PATH a lane's worker unit was pinned with, on that lane's own record.
+
+    ``launch()`` already **returns** the exact PATH it put on the unit; this writes that value —
+    never a recomputed one — onto the lane at dispatch. It is what lets the controller's own
+    acceptance re-run (``probe``/``advance``) run the lane's ``test_cmd`` under the PATH its worker
+    actually had, instead of the launcher's own PATH: without it the two are different variables by
+    construction, and "the test the worker passed" need not be the test the controller can run.
+
+    An empty value is never recorded: absent means "no recorded PATH", which the re-run sites read
+    as the ambient environment — exactly the behaviour older ledgers keep.
+    """
+    if not unit_path:
+        return
+
+    def mutate(doc: dict) -> None:
+        lane = (doc.get("lanes") or {}).get(lane_id)
+        if isinstance(lane, dict):
+            lane[UNIT_PATH_FIELD] = unit_path
+
+    _update_document(ledger_path, mutate)
 
 
 def _load_ledger(path: Path) -> Ledger:
@@ -325,11 +367,15 @@ def _git(worktree: Path, *args: str) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def _run_test_cmd(test_cmd: list[str], worktree: Path) -> tuple[int, str]:
+def _run_test_cmd(test_cmd: list[str], worktree: Path,
+                  unit_path: str | None = None) -> tuple[int, str]:
     """Re-run the lane's OWN ``test_cmd`` in its worktree: ``(rc, output tail)``.
 
     The command comes from the ledger, never from the worker, and this is the same acceptance
-    re-run ``probe`` performs — so ``settle --accept`` cannot be talked past a red test.
+    re-run ``probe`` performs — so ``settle --accept`` cannot be talked past a red test. The
+    **environment** is the lane's own recorded launch PATH when it has one (the rule lives once, in
+    ``probe._test_cmd_env``), so the CLI's re-run reproduces the PATH the worker ran under instead
+    of the conductor's; with no recording the ambient environment is inherited, as before.
     """
     cmd = [str(part) for part in test_cmd]
     if not cmd:
@@ -338,7 +384,8 @@ def _run_test_cmd(test_cmd: list[str], worktree: Path) -> tuple[int, str]:
         return 127, f"worktree is not a directory: {worktree}"
     try:
         proc = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
-                              timeout=TEST_TIMEOUT)
+                              timeout=TEST_TIMEOUT,
+                              env=probe_mod._test_cmd_env(unit_path))
     except subprocess.TimeoutExpired:
         return 124, f"test_cmd timed out after {TEST_TIMEOUT:.0f}s"
     except (OSError, ValueError) as exc:
@@ -391,23 +438,110 @@ def _git_common_root(worktree: Path) -> Path | None:
 
 
 # --- git side effects (performed ONLY inside the envelope) -------------------
+def is_evidence_path(rel: str) -> bool:
+    """Whether ``rel`` is lane evidence (a sidecar, a cache, a ``.pyc``) rather than product.
+
+    Matched on path *components*, not on a prefix: ``pkg/.oprun/result.x.json`` and
+    ``pkg/__pycache__/mod.cpython-312.pyc`` are excluded exactly like the top-level ones.
+    """
+    parts = [part for part in str(rel).replace("\\", "/").split("/") if part not in ("", ".")]
+    if any(part in EVIDENCE_DIRNAMES for part in parts):
+        return True
+    return bool(parts) and parts[-1].endswith(EVIDENCE_SUFFIXES)
+
+
+def _status_paths(worktree: Path) -> tuple[list[str] | None, str]:
+    """Every changed path git reports — raw, unquoted, renames resolved to the new name.
+
+    ``--porcelain -z`` is the only parseable form: NUL-separated entries, never quoted, so a path
+    with a space or a newline cannot split one entry into two. A rename/copy entry is followed by
+    the ORIGINAL path as its own record; that record is skipped, because the new name is the path
+    that has to be staged. Paths are relative to the repo root, as git reports them.
+    """
+    rc, out, err = _git(worktree, "status", "--porcelain", "-z", "--untracked-files=all")
+    if rc != 0:
+        return None, f"git status failed: {(err or out).strip()}"
+    fields = out.split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        if entry[:1] in ("R", "C"):
+            index += 1                 # the next record is the rename's original path
+        paths.append(entry[3:])
+    return paths, ""
+
+
+def _staged_paths(worktree: Path) -> tuple[list[str] | None, str]:
+    """What the index holds right now, relative to the repo root (``diff --cached --name-only``)."""
+    rc, out, err = _git(worktree, "diff", "--cached", "--name-only", "-z")
+    if rc != 0:
+        return None, f"git diff --cached failed: {(err or out).strip()}"
+    return [path for path in out.split("\0") if path], ""
+
+
+#: ``git add`` takes the paths in batches, so a lane that touched tens of thousands of files cannot
+#: blow past the OS argument limit and turn a staging step into an "argument list too long" failure.
+ADD_BATCH = 500
+
+
 def _do_commit(worktree: Path, lane: str, dispatch_id: str) -> dict:
-    """Stage everything and commit the lane's work if there is anything to commit."""
-    rc_add, _, err_add = _git(worktree, "add", "-A")
-    if rc_add != 0:
-        return {"ok": False, "created": False, "sha": None, "detail": f"git add failed: {err_add.strip()}"}
-    rc_status, status, _ = _git(worktree, "status", "--porcelain")
-    if rc_status != 0:
-        return {"ok": False, "created": False, "sha": None, "detail": "git status failed"}
-    if not status.strip():
-        return {"ok": True, "created": False, "sha": None, "detail": "nothing to commit"}
+    """Commit the lane's work: **explicit paths, and never a byte of lane evidence.**
+
+    ``git add -A`` staged ``<worktree>/.oprun/`` (this lane's own sidecars) and ``__pycache__/``
+    into the product commit. On a mission repo with no ignore rule that shipped the evidence into
+    the very history it is the review record for. So the paths come from git rather than from a
+    guess: evidence paths are dropped from the list, anything a worker had already staged is
+    unstaged again, and the commit is only made once the index is verified to hold no evidence. If
+    the index cannot be cleaned the commit is refused outright — the sidecar dir shipping is worse
+    than a failed settle.
+    """
+    candidates, problem = _status_paths(worktree)
+    if candidates is None:
+        return {"ok": False, "created": False, "sha": None, "detail": problem}
+
+    staged_now, problem = _staged_paths(worktree)
+    if staged_now is None:
+        return {"ok": False, "created": False, "sha": None, "detail": problem}
+    leaked = sorted(path for path in staged_now if is_evidence_path(path))
+    if leaked:
+        rc, out, err = _git(worktree, "reset", "-q", "--", *leaked)
+        if rc != 0:
+            return {"ok": False, "created": False, "sha": None, "excluded": leaked,
+                    "detail": (f"refusing to commit: evidence paths were staged and could not be "
+                               f"unstaged: {leaked} ({(err or out).strip()})")}
+
+    to_stage = [path for path in candidates if not is_evidence_path(path)]
+    excluded = sorted(path for path in candidates if is_evidence_path(path))
+    for start in range(0, len(to_stage), ADD_BATCH):
+        rc_add, _, err_add = _git(worktree, "add", "-A", "--",
+                                  *to_stage[start:start + ADD_BATCH])
+        if rc_add != 0:
+            return {"ok": False, "created": False, "sha": None, "excluded": excluded,
+                    "detail": f"git add failed: {err_add.strip()}"}
+
+    staged, problem = _staged_paths(worktree)
+    if staged is None:
+        return {"ok": False, "created": False, "sha": None, "detail": problem}
+    leaked = sorted(path for path in staged if is_evidence_path(path))
+    if leaked:
+        return {"ok": False, "created": False, "sha": None, "staged": sorted(staged),
+                "excluded": excluded,
+                "detail": f"refusing to commit: lane evidence is in the index: {leaked}"}
+    if not staged:
+        return {"ok": True, "created": False, "sha": None, "staged": [], "excluded": excluded,
+                "detail": "nothing to commit"}
     message = f"oprun({lane}): {dispatch_id}"
     rc, out, err = _git(worktree, "commit", "-m", message)
     if rc != 0:
-        return {"ok": False, "created": False, "sha": None,
+        return {"ok": False, "created": False, "sha": None, "staged": sorted(staged),
+                "excluded": excluded,
                 "detail": f"git commit failed: {(out + err).strip()[-TAIL_CHARS:]}"}
     return {"ok": True, "created": True, "sha": _git_head(worktree), "message": message,
-            "detail": "committed"}
+            "staged": sorted(staged), "excluded": excluded, "detail": "committed"}
 
 
 def _do_push(worktree: Path, remote: str, branch: str, *, force: bool = False,
@@ -430,8 +564,14 @@ def _do_push(worktree: Path, remote: str, branch: str, *, force: bool = False,
     }
 
 
-def _do_merge(worktree: Path, branch: str) -> dict:
-    """Merge the lane's branch into the primary worktree's checked-out branch.
+def _do_merge(worktree: Path, branch: str, into: str | None = None) -> dict:
+    """Merge the lane's branch into the recorded target — and into nothing else.
+
+    ``into`` is the branch the lane recorded (``dispatch --into`` / ``settle --into``). When the
+    primary worktree does not have *that* branch checked out, the merge is refused by name and
+    nothing is touched: merging into whatever happens to be checked out is how a lane's work lands
+    on the wrong branch "by luck". With no target recorded, the previous behaviour stands (merge
+    into the primary worktree's checked-out branch).
 
     ``--ff-only`` first (the usual case for a lane branched off the base); a real merge commit
     only when the histories genuinely diverged. Never forced, never destructive.
@@ -442,17 +582,24 @@ def _do_merge(worktree: Path, branch: str) -> dict:
     target = _current_branch(primary)
     if target is None:
         return {"ok": False, "skipped": f"the primary worktree {primary} is in a detached HEAD"}
+    if into and target != into:
+        return {"ok": False, "refused": True, "into": into, "checked_out": target,
+                "primary": str(primary),
+                "detail": (f"refusing to merge {branch!r} into {into!r}: the primary worktree "
+                           f"{primary} has {target!r} checked out")}
     if target == branch:
-        return {"ok": True, "skipped": f"the lane branch {branch!r} is already checked out in {primary}"}
+        return {"ok": True, "skipped": f"the lane branch {branch!r} is already checked out in {primary}",
+                "into": target, "recorded_into": into}
     rc, out, err = _git(primary, "merge", "--ff-only", branch)
     detail = (out + err).strip()[-TAIL_CHARS:]
     if rc != 0:
         rc2, out2, err2 = _git(primary, "merge", "--no-edit", branch)
         detail = (out2 + err2).strip()[-TAIL_CHARS:]
         if rc2 != 0:
-            return {"ok": False, "into": target, "primary": str(primary), "detail": detail}
-    return {"ok": True, "into": target, "primary": str(primary), "sha": _git_head(primary),
-            "detail": detail}
+            return {"ok": False, "into": target, "recorded_into": into, "primary": str(primary),
+                    "detail": detail}
+    return {"ok": True, "into": target, "recorded_into": into, "primary": str(primary),
+            "sha": _git_head(primary), "detail": detail}
 
 
 def _do_tag(worktree: Path, remote: str, tag: str) -> dict:
@@ -600,6 +747,30 @@ def _resolve_binary(binary: str) -> str | None:
     return shutil.which(binary)
 
 
+def _resolve_test_program(test_cmd: list[str]) -> str | None:
+    """The runnable path of ``test_cmd[0]`` on THIS host, or ``None`` when it cannot be run.
+
+    The acceptance command is re-run by the controller, not by the worker, so it has to be runnable
+    *here*. A bare tool name (``npx``, ``node``, ``npm``) is resolved through this process's PATH; an
+    explicit path is accepted only when it is a real executable file. A directory, a missing file, a
+    typo, or a tool that only exists in the worker's environment all return ``None``.
+
+    Checked at DISPATCH time on purpose (issue #1): a lane whose command cannot be started would
+    otherwise burn a worker and be discovered only at settlement, where "could not run" (rc 127) was
+    reported as if the lane's tests had failed — parking the lane and striking the circuit breaker
+    for something the lane never did.
+    """
+    if not test_cmd:
+        return None
+    program = str(test_cmd[0])
+    if not program:
+        return None
+    if os.sep in program or (os.altsep and os.altsep in program):
+        target = Path(program).expanduser()
+        return str(target) if target.is_file() and os.access(target, os.X_OK) else None
+    return shutil.which(program)
+
+
 # --- identity: the designation vs what the worker reported -------------------
 def _current_sidecar(worktree: Path, dispatch_id: str) -> tuple[dict | None, str]:
     """The lane's sidecar for its CURRENT dispatch: ``(document, problem)``.
@@ -734,6 +905,18 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     test_cmd = shlex.split(args.test_cmd or "")
     if not test_cmd:
         raise CLIError("--test-cmd must name the command that decides this lane's acceptance")
+    # Preflight, BEFORE anything is registered or launched: the controller has to be able to START
+    # this command, and it runs it here, not in the worker's environment. An unresolvable program is
+    # refused loudly now instead of surfacing at settle as rc 127 — which used to be reported as a
+    # failed test, parking the lane and striking the breaker (issue #1).
+    if _resolve_test_program(test_cmd) is None:
+        raise CLIError(
+            f"--test-cmd program {test_cmd[0]!r} cannot be run on this host: it is not on PATH and "
+            f"is not an executable file. The controller's acceptance re-run would fail to start it "
+            f"(rc 127: an environment fault, not a red test), so this dispatch is refused before "
+            f"it registers a lane or burns a worker. Pass an absolute path, or install the tool.",
+            EXIT_REFUSED,
+        )
 
     if args.brief and args.prompt:
         raise CLIError("--brief and --prompt are alternatives; pass one")
@@ -761,6 +944,9 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         model=args.model,
         depends_on=list(args.depends_on or []),
         depth=args.depth,
+        # Where this lane's work is meant to land, recorded **now** (at dispatch) so settle can
+        # refuse a primary worktree that is on some other branch instead of merging by luck.
+        merge_into=_branch_name(args.into, flag="--into") if args.into else None,
     )
     dispatch_id = led.dispatch(lane)   # dependency gate / depth / cap live here
 
@@ -789,6 +975,13 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                    evidence={"controller": "oprun-dispatch", "dispatch_id": dispatch_id,
                              "launch": result, "checked_at": _utc_now()})
         raise CLIError(f"lane {lane!r} not launched: {result.get('detail')}")
+
+    # Record the PATH this unit was pinned with on the lane's own record — the value ``launch()``
+    # itself reports, never a recomputed one — so the controller's acceptance re-run re-runs the
+    # lane's ``test_cmd`` under the same PATH its worker had. Without it the worker's PATH and the
+    # controller's PATH are different variables by construction and the acceptance test can fail
+    # ENOENT for a tool the worker used happily (issue #1's residual asymmetry).
+    _record_unit_path(ledger_path, lane, str(result.get("path") or ""))
 
     print(dispatch_id)
     print(f"oprun dispatch: lane {lane!r} -> unit {unit} (detached, "
@@ -885,6 +1078,70 @@ def _planned_actions(worktree: Path, branch: str | None) -> list[str]:
     return planned
 
 
+# --- the recorded merge target ----------------------------------------------
+#: Characters git itself refuses in a branch name. A target that cannot be a branch name is a typo,
+#: and a typo must never become a merge target quietly.
+_ILLEGAL_BRANCH_CHARS = (" ", "~", "^", ":", "?", "*", "[", "\\", '"')
+
+
+def _branch_name(value: str | None, *, flag: str) -> str:
+    """Validate a ``--into`` value as a branch name, or refuse it as a typo (never a guess)."""
+    name = (value or "").strip()
+    if not name:
+        raise CLIError(f"{flag} needs a branch name", EXIT_USAGE)
+    if (name in ("HEAD", "@", "-") or name.startswith("-") or ".." in name or "@{" in name
+            or name.endswith("/") or name.endswith(".lock")
+            or any(ch in name for ch in _ILLEGAL_BRANCH_CHARS)):
+        raise CLIError(f"{flag} is not a branch name: {value!r}", EXIT_USAGE)
+    return name
+
+
+def _merge_target(lane: dict, lane_id: str, requested: str | None) -> str | None:
+    """The branch this settle must merge into: recorded at dispatch, or stated here.
+
+    ``--into`` at settle may repeat what ``dispatch --into`` recorded, or set the target for a lane
+    dispatched before ``--into`` existed. A *different* branch is refused before any mutation:
+    retargeting work that was already reviewed against another branch is a new dispatch, not a
+    quiet retarget. With no target recorded anywhere, ``None`` means the legacy behaviour (merge
+    into whatever the primary worktree has checked out).
+    """
+    recorded = lane.get("merge_into") or None
+    want = _branch_name(requested, flag="--into") if requested else None
+    if recorded and want and recorded != want:
+        raise CLIError(
+            f"refusing --into {want!r}: lane {lane_id!r} was dispatched with --into {recorded!r}; "
+            f"re-dispatch the lane to retarget it",
+            EXIT_USAGE,
+        )
+    return recorded or want
+
+
+def _record_merge_target(ledger_path: Path, lane_id: str, target: str) -> None:
+    """Persist a target first stated at settle, so the next reader sees the same intent."""
+    def mutate(doc: dict) -> None:
+        lanes = doc.get("lanes") if isinstance(doc.get("lanes"), dict) else {}
+        if lane_id in lanes:
+            lanes[lane_id]["merge_into"] = target
+    _update_document(ledger_path, mutate)
+
+
+def _merge_target_problem(worktree: Path, target: str) -> str | None:
+    """Why ``target`` cannot be merged into right now, naming both branches. ``None`` when it can.
+
+    The check runs *before* any mutation: a settle that would commit and push and then merge into
+    the wrong branch is the failure this names, and it must not be discovered afterwards.
+    """
+    primary = _git_common_root(worktree)
+    if primary is None:
+        return f"cannot resolve the repository root from the lane worktree {worktree}"
+    checked_out = _current_branch(primary)
+    if checked_out == target:
+        return None
+    return (f"refusing to merge: the lane's target is {target!r} but the primary worktree "
+            f"{primary} has {checked_out or 'a detached HEAD'} checked out; check out "
+            f"{target!r} and settle again")
+
+
 def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
                          dispatch_id: str, worktree: Path) -> int:
     """Park the lane for a human. Records evidence; **performs no git mutation at all**."""
@@ -970,8 +1227,8 @@ def cmd_settle(args: argparse.Namespace) -> int:
 
     if args.needs_review is not None:
         if any((args.force, args.rewrite_history, args.delete_branch, args.tag, args.release,
-                args.repo)):
-            raise CLIError("--needs-review accepts no git side-effect flags", EXIT_USAGE)
+                args.repo, args.into)):
+            raise CLIError("--needs-review accepts no git target or side-effect flags", EXIT_USAGE)
         if not args.needs_review.strip():
             raise CLIError("--needs-review needs a reason: it is what the next reader gets")
         return _settle_needs_review(args, led, lane, str(dispatch_id), worktree)
@@ -982,6 +1239,15 @@ def cmd_settle(args: argparse.Namespace) -> int:
     problems = _risky_request(args, envelope, worktree)
     if problems:
         raise CLIError("; ".join(problems), EXIT_REFUSED)
+
+    # 1b. The merge target is fixed here — once, before anything moves. It comes from the lane's
+    #     own record (``dispatch --into``), or from ``--into`` on this settle; a lane dispatched
+    #     with one target refuses a different one, and a target stated for the first time here is
+    #     recorded so the next reader sees the same intent.
+    merge_target = _merge_target(lane, args.lane, getattr(args, "into", None))
+    if merge_target and not lane.get("merge_into"):
+        _record_merge_target(ledger_path, args.lane, merge_target)
+        lane["merge_into"] = merge_target
 
     # 2. Identity: the ledger's designation vs what the worker reported. This runs before the test
     #    re-run and before any git side effect, so a substituted lane is never committed, pushed or
@@ -1012,7 +1278,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
                                    identity_warning=warning)
 
     # 3. The controller's own re-run of the lane's test. Red test => no accept.
-    rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree)
+    rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree, lane.get(UNIT_PATH_FIELD))
     if rc != 0:
         raise CLIError(
             f"lane {args.lane!r} test_cmd exited {rc}; refusing --accept "
@@ -1022,6 +1288,11 @@ def cmd_settle(args: argparse.Namespace) -> int:
 
     branch = _current_branch(worktree)
     planned = _planned_actions(worktree, branch)
+
+    # 3b. The merge target, printed BEFORE any mutation: a lane records where its work lands, so
+    #     the operator sees the branch this settle is aimed at before anything moves.
+    if branch and merge_target:
+        print(f"  merge target: {merge_target}")
 
     # 4. Anything the envelope does not grant is asked about exactly once, and recorded.
     missing = [action for action in planned if not is_granted(envelope, action)]
@@ -1035,6 +1306,15 @@ def cmd_settle(args: argparse.Namespace) -> int:
         led = _load_ledger(ledger_path)
 
     allowed = {action for action in GIT_ACTIONS if is_granted(envelope, action)}
+
+    # 4b. The recorded target is enforced against the REAL checkout, before any of this settle's git
+    #     side effects: a merge the envelope allows but the primary worktree cannot receive is
+    #     refused here, naming the target and the branch actually checked out. Nothing below this
+    #     line runs, so no commit and no push precede the refusal either.
+    if "merge" in allowed and branch and merge_target:
+        problem = _merge_target_problem(worktree, merge_target)
+        if problem:
+            raise CLIError(problem, EXIT_REFUSED)
 
     # 5. Git side effects, in order: commit -> push -> merge -> (tag / release).
     commit_info: dict | None = None
@@ -1057,7 +1337,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
         if not push_info.get("ok"):
             failures.append(f"push: {push_info.get('detail')}")
     if "merge" in allowed and branch:
-        merge_info = _do_merge(worktree, branch)
+        merge_info = _do_merge(worktree, branch, into=merge_target)
         if not merge_info.get("ok"):
             failures.append(f"merge: {merge_info.get('detail')}")
     if args.tag:
@@ -1094,8 +1374,15 @@ def cmd_settle(args: argparse.Namespace) -> int:
         # harness self-report, and the reviewer should not have to open the sidecar to find out.
         "identity_warning": warning,
         "commit": (commit_info or {}).get("sha") or git_info.get("commit") or None,
+        # What the commit actually recorded, and what was kept out of it. A reviewer can read the
+        # sidecar dir shipping question off the ledger instead of re-running `git show --stat`.
+        "commit_paths": (commit_info or {}).get("staged"),
+        "commit_excluded": (commit_info or {}).get("excluded"),
         "uncommitted": git_info.get("uncommitted"),
         "hashes": git_info.get("hashes") or {},
+        # The branch this settle was allowed to merge into (recorded at dispatch / settle), so a
+        # reviewer can see the target without re-reading the CLI invocation.
+        "merge_target": merge_target,
         "push": push_info,
         "merge": merge_info,
         "tag": tag_info,
@@ -1155,15 +1442,20 @@ def _next_action(lanes: dict) -> str:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Lanes + counts + ``nextAction`` + **the active approval envelope**."""
+    """Lanes + counts + ``nextAction`` + **the active approval envelope**.
+
+    Each lane is reported in its DISPLAY state (``ledger.display_state``): a lane settled as a
+    non-acceptance reads ``parked`` — waiting for a decision — instead of ``failed``, which reads as
+    "the mission broke". The stored state, the fences and ``nextAction`` are untouched.
+    """
     ledger_path = _require_ledger(_ledger_path(args))
     doc = _read_doc(ledger_path)
     lanes = doc.get("lanes") if isinstance(doc.get("lanes"), dict) else {}
     envelope = normalize_envelope(doc.get("approvals"))
+    display = {lane_id: display_state(lane) for lane_id, lane in lanes.items()}
     counts: dict[str, int] = {}
-    for lane in lanes.values():
-        status = str(lane.get("status"))
-        counts[status] = counts.get(status, 0) + 1
+    for state in display.values():
+        counts[state] = counts.get(state, 0) + 1
     next_action = _next_action(lanes)
 
     payload = {
@@ -1174,6 +1466,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "max_parallel": doc.get("max_parallel", 4),
         "failure_limit": doc.get("failure_limit", 3),
         "counts": counts,
+        "display": display,
         "lanes": lanes,
         "nextAction": next_action,
         "approvals": envelope,
@@ -1186,8 +1479,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"ledger:     {ledger_path}")
     print(f"lanes:      {len(lanes)}   " + "  ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for lane_id, lane in lanes.items():
-        print(f"  {lane_id:<20} {lane.get('status'):<10} harness={lane.get('harness')}"
-              f"  dispatch={lane.get('dispatch_id')}")
+        state = display[lane_id]
+        line = (f"  {lane_id:<20} {state:<10} harness={lane.get('harness')}"
+                f"  dispatch={lane.get('dispatch_id')}")
+        if state == PARKED:
+            # The word alone is not enough for a reader: say why the lane is waiting. The stored
+            # status stays visible in ``status --json`` (``lanes.<id>.status``) and in the ledger
+            # file; the text view shows the one word a human acts on.
+            line += f"  reason={lane.get('needs_review_reason')!r}"
+        if lane.get("merge_into"):
+            line += f"  merge_into={lane['merge_into']}"
+        print(line)
     print(envelope_text(envelope))
     print(f"nextAction: {next_action}")
     return EXIT_OK
@@ -1274,6 +1576,9 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--prompt", default=None, metavar="TEXT", help="the task, inline")
     dispatch.add_argument("--depends-on", action="append", default=[], metavar="LANE",
                           help="a parent lane that must be completed first (repeatable)")
+    dispatch.add_argument("--into", default=None, metavar="BRANCH",
+                          help="the branch this lane's work must land on (recorded; settle refuses "
+                               "a primary worktree checked out elsewhere)")
     dispatch.add_argument("--depth", type=int, default=0, metavar="N",
                           help="nesting depth (0 = root; a nested lane is refused past max_depth)")
     _add_ledger_option(dispatch, suppress=True)
@@ -1308,6 +1613,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="create a release for --tag: needs a fresh --grant publish")
     settle.add_argument("--repo", default=None, metavar="URL",
                         help="push to another repo: needs a fresh --grant publish")
+    settle.add_argument("--into", default=None, metavar="BRANCH",
+                        help="the branch to merge into: must match the lane's recorded --into; "
+                             "refused when the primary worktree is checked out elsewhere")
     settle.add_argument("--by", default="user", help="who answered the approval prompt")
     settle.add_argument("--scope", default="mission", help="the grant's scope (default: mission)")
     _add_ledger_option(settle, suppress=True)

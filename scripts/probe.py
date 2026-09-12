@@ -13,7 +13,9 @@ already true, in this order:
 3. the controller's **own re-run** of the lane's ``test_cmd``, plus a disk check of every evidence
    path the sidecar names.
 
-``done`` requires all three to agree. Anything less is ``needs_input`` (a human decides),
+``done`` requires all three to agree. Anything less is ``infra`` (the controller could not RUN the
+lane's own ``test_cmd`` — ENOENT, not executable, or its own budget ran out: an environment fault,
+never a red test, and never counted as a lane failure), ``needs_input`` (a human decides),
 ``stalled`` (the timeout passed with no acceptable artifact), ``pending`` (the unit is still
 running and there is no artifact yet), or ``failed`` (the ledger parked the lane).
 
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -36,7 +39,11 @@ from typing import Any, Callable, Iterator
 from ledger import BLOCKED, DISPATCHED, FAILED, Ledger
 
 #: The complete verdict vocabulary. Every return value of :func:`probe` is one of these.
-VERDICTS = ("done", "pending", "needs_input", "stalled", "failed")
+#: ``infra`` is the sixth: the controller could not RUN the lane's acceptance command (the program
+#: is not on PATH, or the run blew the controller's own budget). That is the *environment* failing,
+#: never a red test — conflating the two is issue #1, where an ENOENT inside a systemd unit came
+#: back as rc 127 and was settled as a lane failure with a circuit-breaker strike attached.
+VERDICTS = ("done", "infra", "pending", "needs_input", "stalled", "failed")
 
 #: Registry ids, matching ``harnesses.py``. Every shipped harness must be mapped below: an
 #: unmapped harness that reached :func:`probe` would be silently treated as success.
@@ -50,6 +57,26 @@ SIDECAR_TEMPLATE = "result.{dispatch_id}.json"
 
 #: Seconds the acceptance re-run of a lane's own ``test_cmd`` may take (``timeout(1)`` rc 124).
 TEST_CMD_TIMEOUT_SECONDS = 900
+
+#: rc the controller assigns when the lane's ``test_cmd`` could not be STARTED at all: the program
+#: is not on PATH (ENOENT), is not executable, or the arguments are malformed. The command never
+#: reached a verdict of its own, so this is the environment's failure — the ``infra`` verdict —
+#: and never a red test.
+TEST_CMD_NOT_RUNNABLE_RC = 127
+
+#: rc the controller assigns when the re-run blew its own wall-clock budget (``timeout(1)``
+#: convention). Also the environment's fault rather than the lane's: the tests never finished.
+TEST_CMD_TIMEOUT_RC = 124
+
+#: The lane field recording the PATH the lane's worker unit was launched with (written at
+#: dispatch from ``launch()``'s own report: see ``scripts/oprun.py``). Read here, never derived:
+#: an absent/blank value means "not recorded", and the re-run then inherits the ambient
+#: environment exactly as it did before the field existed. The same field name is pinned in
+#: ``advance.py`` (``UNIT_PATH_FIELD``) and asserted identical by the suite.
+UNIT_PATH_FIELD = "unit_path"
+
+#: The one environment variable the re-run overrides. Nothing is resolved from it, ever.
+PATH_ENV = "PATH"
 
 #: Seconds ``systemctl --user is-active`` may take before liveness is reported as False.
 SYSTEMCTL_TIMEOUT_SECONDS = 15
@@ -325,14 +352,49 @@ def _missing_evidence_paths(sidecar: dict, root: Path, base: Path) -> list[str]:
     return missing
 
 
-def _run_test_cmd(test_cmd: list[str], worktree: Path) -> tuple[int, str]:
-    """The controller's OWN re-run of the lane's ``test_cmd``. Returns ``(rc, output tail)``.
+def _test_cmd_env(unit_path: str | None) -> dict[str, str] | None:
+    """The environment a lane's ``test_cmd`` is re-run under — ``None`` means "inherit ours".
+
+    A lane whose worker unit was pinned with a PATH (``unit_path``, recorded at dispatch from
+    ``launch()``'s own report) gets the *same* PATH back here: a copy of the current environment
+    whose ``PATH`` is exactly that recorded value. Without this, the worker and the controller
+    re-run the lane's acceptance command under two different PATHs by construction, so "the test
+    the worker passed" and "the test the controller can run" need not be the same test.
+
+    Deliberately nothing else: no ``shutil.which``, no resolution, no heuristic, no default
+    entries. An absent or blank recording is not a PATH, and the caller then passes ``env=None``
+    so the child inherits the ambient environment — the behaviour every older ledger keeps.
+
+    ``advance._test_cmd_env`` is this function's twin (``advance`` must run with or without this
+    module) and ``scripts/oprun.py``'s ``settle --accept`` re-run calls this one directly rather
+    than keeping a third copy. Every one of them reads the same lane field.
+    """
+    recorded = str(unit_path or "").strip()
+    if not recorded:
+        return None
+    return {**os.environ, PATH_ENV: recorded}
+
+
+def _run_test_cmd(test_cmd: list[str], worktree: Path,
+                  unit_path: str | None = None) -> tuple[int, str, str]:
+    """The controller's OWN re-run of the lane's ``test_cmd``: ``(rc, output tail, infra_reason)``.
 
     Nothing the worker reported matters here: this is the acceptance test executing on the
-    controller's side. rc 127 = could not run, rc 124 = timed out.
+    controller's side. ``unit_path`` is the PATH the lane's worker unit was launched with, when
+    the ledger has one (see :func:`_test_cmd_env`); the command then runs under that PATH instead
+    of the controller's own. ``infra_reason`` is non-empty **only** when the run never produced a
+    verdict of the command's own:
+
+    * the command could not be started (ENOENT/OSError/ValueError) -> rc 127;
+    * the controller killed it on its own budget -> rc 124.
+
+    A non-zero rc with an empty ``infra_reason`` is the lane's own failing test. The two are kept
+    apart on purpose (issue #1): an environment fault settled as a red test parks a lane and feeds
+    the circuit breaker for something the lane never did.
     """
     if not worktree.is_dir():
-        return 127, f"worktree is not a directory: {worktree}"
+        return TEST_CMD_NOT_RUNNABLE_RC, f"worktree is not a directory: {worktree}", \
+            f"worktree is not a directory: {worktree}"
     try:
         proc = subprocess.run(
             [str(part) for part in test_cmd],
@@ -340,13 +402,16 @@ def _run_test_cmd(test_cmd: list[str], worktree: Path) -> tuple[int, str]:
             capture_output=True,
             text=True,
             timeout=TEST_CMD_TIMEOUT_SECONDS,
+            env=_test_cmd_env(unit_path),
         )
     except subprocess.TimeoutExpired:
-        return 124, f"test_cmd timed out after {TEST_CMD_TIMEOUT_SECONDS}s"
+        return (TEST_CMD_TIMEOUT_RC, f"test_cmd timed out after {TEST_CMD_TIMEOUT_SECONDS}s",
+                f"test_cmd timed out after {TEST_CMD_TIMEOUT_SECONDS}s")
     except (OSError, ValueError) as exc:
-        return 127, f"test_cmd could not be run: {exc}"
+        return TEST_CMD_NOT_RUNNABLE_RC, f"test_cmd could not be run: {exc}", \
+            f"test_cmd could not be run: {exc}"
     tail = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode, tail.strip()[-400:]
+    return proc.returncode, tail.strip()[-400:], ""
 
 
 def _read_sidecar(path: Path | None) -> tuple[dict | None, str]:
@@ -394,11 +459,19 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
     Acceptance (all five, in this order): the sidecar exists at
     ``<worktree>/.oprun/result.<dispatch_id>.json`` for the ledger's CURRENT dispatch; its
     ``task_id``/``dispatch_id`` match that lane and dispatch; ``status == "success"``; the
-    controller re-runs ``lane["test_cmd"]`` and it exits 0; every evidence path resolves.
+    controller re-runs ``lane["test_cmd"]`` and it exits 0; every evidence path resolves. The
+    re-run executes under the PATH the lane's worker unit was launched with
+    (``lane["unit_path"]``, recorded at dispatch), falling back to the ambient environment when the
+    lane has no recorded PATH — so a lane's acceptance command runs where its worker ran it.
 
     ``unit_active`` (systemd lifetime) and ``timeout_exceeded`` only classify *absence* of an
     artifact: pending while the unit runs, ``stalled`` once the timeout has passed, otherwise
     ``needs_input``. A parked (FAILED/BLOCKED) ledger lane is ``failed``, full stop.
+
+    The one verdict that is not about the lane at all: when the acceptance re-run cannot be
+    *started* (or the controller's own budget kills it) the verdict is ``infra`` — the command
+    never ran, so no test is proven red and the lane is not failing. A red re-run (a real non-zero
+    exit of the command itself) stays ``needs_input``, exactly as before.
     """
     status = lane.get("status")
     dispatch_id = lane.get("dispatch_id")
@@ -411,6 +484,9 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
     root = _roots(lane, base)
     path = _sidecar_path(base, dispatch_id)
     test_cmd = [str(part) for part in lane.get("test_cmd") or []]
+    # Recorded at dispatch on the lane's own record: the PATH its worker unit was pinned with.
+    # Read from the lane dict handed in — never sniffed from the environment, never recomputed.
+    unit_path = str(lane.get(UNIT_PATH_FIELD) or "").strip()
 
     evidence: dict[str, Any] = {
         "lane_id": lane_id,
@@ -424,6 +500,8 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
         "unit_active": bool(unit_active),
         "timeout_exceeded": bool(timeout_exceeded),
         "test_cmd": test_cmd,
+        # ``None`` means "no recorded PATH": the re-run then inherits the ambient environment.
+        "unit_path": unit_path or None,
         "test_rc": None,
         "missing_evidence_paths": [],
     }
@@ -483,9 +561,15 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
     # 4. the controller re-runs the lane's OWN test command.
     if not test_cmd:
         return verdict("needs_input", "lane has no test_cmd: evidence alone cannot be accepted")
-    rc, tail = _run_test_cmd(test_cmd, root)
+    rc, tail, infra_reason = _run_test_cmd(test_cmd, root, unit_path=unit_path)
     evidence["test_rc"] = rc
     evidence["test_output_tail"] = tail
+    if infra_reason:
+        # The command never reached a verdict of its own: the environment could not run it. This is
+        # `infra`, never `failed`/`needs_input` — no test was proven red, so nothing here may be
+        # counted as a lane failure (issue #1).
+        evidence["infra_reason"] = infra_reason
+        return verdict("infra", f"controller could not run test_cmd {test_cmd!r}: {infra_reason}")
     if rc != 0:
         return verdict("needs_input",
                        f"controller re-run of test_cmd exited {rc} "
