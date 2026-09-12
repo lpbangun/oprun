@@ -91,6 +91,14 @@ MISSION_STATE = "state.json"
 SIDECAR_DIRNAME = ".oprun"
 SIDECAR_TEMPLATE = "result.{dispatch_id}.json"
 
+#: The lane field recording the PATH the lane's worker unit was launched with. Written here at
+#: dispatch from ``launch()``'s own report (``result["path"]``), and read by every acceptance
+#: re-run site — ``probe._run_test_cmd``, ``advance._run_test`` and this module's own
+#: ``_run_test_cmd`` (``settle --accept``) — so a lane's ``test_cmd`` runs under the environment its
+#: worker actually had. Spelled identically in those modules; the suite pins them to one string so
+#: the contract cannot drift.
+UNIT_PATH_FIELD = "unit_path"
+
 #: Paths that are **lane evidence, never product**: the sidecar directory, byte-code caches, and
 #: compiled artefacts. This is the same rule set the repo's own ``.gitignore`` commits, but it is
 #: enforced here as well, because the lane worktree belongs to the *mission* repo — which may have
@@ -178,6 +186,29 @@ def _update_document(path: Path, mutate: Callable[[dict], None]) -> dict:
         mutate(led.data)
         led._write()  # noqa: SLF001 - and its file format
     return led.data
+
+
+def _record_unit_path(ledger_path: Path, lane_id: str, unit_path: str) -> None:
+    """Persist the PATH a lane's worker unit was pinned with, on that lane's own record.
+
+    ``launch()`` already **returns** the exact PATH it put on the unit; this writes that value —
+    never a recomputed one — onto the lane at dispatch. It is what lets the controller's own
+    acceptance re-run (``probe``/``advance``) run the lane's ``test_cmd`` under the PATH its worker
+    actually had, instead of the launcher's own PATH: without it the two are different variables by
+    construction, and "the test the worker passed" need not be the test the controller can run.
+
+    An empty value is never recorded: absent means "no recorded PATH", which the re-run sites read
+    as the ambient environment — exactly the behaviour older ledgers keep.
+    """
+    if not unit_path:
+        return
+
+    def mutate(doc: dict) -> None:
+        lane = (doc.get("lanes") or {}).get(lane_id)
+        if isinstance(lane, dict):
+            lane[UNIT_PATH_FIELD] = unit_path
+
+    _update_document(ledger_path, mutate)
 
 
 def _load_ledger(path: Path) -> Ledger:
@@ -336,11 +367,15 @@ def _git(worktree: Path, *args: str) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def _run_test_cmd(test_cmd: list[str], worktree: Path) -> tuple[int, str]:
+def _run_test_cmd(test_cmd: list[str], worktree: Path,
+                  unit_path: str | None = None) -> tuple[int, str]:
     """Re-run the lane's OWN ``test_cmd`` in its worktree: ``(rc, output tail)``.
 
     The command comes from the ledger, never from the worker, and this is the same acceptance
-    re-run ``probe`` performs — so ``settle --accept`` cannot be talked past a red test.
+    re-run ``probe`` performs — so ``settle --accept`` cannot be talked past a red test. The
+    **environment** is the lane's own recorded launch PATH when it has one (the rule lives once, in
+    ``probe._test_cmd_env``), so the CLI's re-run reproduces the PATH the worker ran under instead
+    of the conductor's; with no recording the ambient environment is inherited, as before.
     """
     cmd = [str(part) for part in test_cmd]
     if not cmd:
@@ -349,7 +384,8 @@ def _run_test_cmd(test_cmd: list[str], worktree: Path) -> tuple[int, str]:
         return 127, f"worktree is not a directory: {worktree}"
     try:
         proc = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
-                              timeout=TEST_TIMEOUT)
+                              timeout=TEST_TIMEOUT,
+                              env=probe_mod._test_cmd_env(unit_path))
     except subprocess.TimeoutExpired:
         return 124, f"test_cmd timed out after {TEST_TIMEOUT:.0f}s"
     except (OSError, ValueError) as exc:
@@ -940,6 +976,13 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                              "launch": result, "checked_at": _utc_now()})
         raise CLIError(f"lane {lane!r} not launched: {result.get('detail')}")
 
+    # Record the PATH this unit was pinned with on the lane's own record — the value ``launch()``
+    # itself reports, never a recomputed one — so the controller's acceptance re-run re-runs the
+    # lane's ``test_cmd`` under the same PATH its worker had. Without it the worker's PATH and the
+    # controller's PATH are different variables by construction and the acceptance test can fail
+    # ENOENT for a tool the worker used happily (issue #1's residual asymmetry).
+    _record_unit_path(ledger_path, lane, str(result.get("path") or ""))
+
     print(dispatch_id)
     print(f"oprun dispatch: lane {lane!r} -> unit {unit} (detached, "
           f"cgroup user@1000.service/app.slice)", file=sys.stderr)
@@ -1235,7 +1278,7 @@ def cmd_settle(args: argparse.Namespace) -> int:
                                    identity_warning=warning)
 
     # 3. The controller's own re-run of the lane's test. Red test => no accept.
-    rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree)
+    rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree, lane.get(UNIT_PATH_FIELD))
     if rc != 0:
         raise CLIError(
             f"lane {args.lane!r} test_cmd exited {rc}; refusing --accept "

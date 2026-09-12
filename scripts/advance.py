@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -111,6 +112,37 @@ INFRA_RUN_RETRIES = 2
 
 #: Seconds between those in-place re-runs.
 INFRA_RETRY_BACKOFF = 0.25
+
+#: The lane field recording the PATH the lane's worker unit was launched with (written at
+#: dispatch from ``launch()``'s own report). Read from the lane dict handed to the runner, never
+#: derived: an absent/blank value means "not recorded" and the acceptance re-run then inherits the
+#: ambient environment exactly as it did before the field existed. Spelled identically in
+#: ``probe.py``; the suite asserts both modules agree, so the two re-run sites can never drift.
+UNIT_PATH_FIELD = "unit_path"
+
+#: The one environment variable the re-run overrides. Nothing is resolved from it, ever.
+PATH_ENV = "PATH"
+
+
+def _test_cmd_env(unit_path: str | None) -> dict[str, str] | None:
+    """The environment a lane's ``test_cmd`` is re-run under — ``None`` means "inherit ours".
+
+    ``launch.py`` pins a PATH onto every worker unit, and the launcher's own report of it is
+    recorded on the lane at dispatch (``unit_path``). The acceptance re-run must happen under that
+    same PATH, or the worker and the controller run the lane's ``test_cmd`` under two different
+    PATHs by construction — "the test the worker passed" need not be the test the controller can
+    run. With a recorded PATH the command runs with a copy of the current environment whose
+    ``PATH`` is exactly that value; with none, ``None`` is returned so the child inherits the
+    ambient environment (every ledger written before the field keeps working unchanged).
+
+    Deliberately nothing else: no ``shutil.which``, no resolution, no heuristic, no default
+    entries. Twin of ``probe._test_cmd_env`` — ``advance`` must run with or without ``probe.py``,
+    so the rule lives in both and each reads the same lane field.
+    """
+    recorded = str(unit_path or "").strip()
+    if not recorded:
+        return None
+    return {**os.environ, PATH_ENV: recorded}
 
 
 class _Decision(NamedTuple):
@@ -359,7 +391,9 @@ def _run_test(lane: dict, worktree: Path, deadline: float) -> tuple[int, str, st
     struck the circuit breaker).
 
     The command and the working directory come from the ledger, never from the worker: a lane
-    can neither choose nor skip the test that decides its own acceptance.
+    can neither choose nor skip the test that decides its own acceptance. The **environment** is
+    the lane's own recorded launch PATH when it has one (:func:`_test_cmd_env`), so the re-run
+    reproduces the PATH the worker ran under instead of the runner's.
     """
     cmd = [str(part) for part in (lane.get("test_cmd") or [])]
     if not cmd:
@@ -367,7 +401,8 @@ def _run_test(lane: dict, worktree: Path, deadline: float) -> tuple[int, str, st
     budget = min(TEST_TIMEOUT, max(1.0, deadline - time.monotonic()))
     try:
         proc = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
-                              timeout=budget)
+                              timeout=budget,
+                              env=_test_cmd_env(lane.get(UNIT_PATH_FIELD)))
     except subprocess.TimeoutExpired:
         why = f"test command exceeded {budget:.0f}s"
         return 124, "", why, why
@@ -575,6 +610,10 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         # accepted lane can still carry a disagreeing harness self-report.
         "identity_warning": str(verdict["evidence"].get("identity_warning") or ""),
         "test_cmd": [str(part) for part in (lane.get("test_cmd") or [])],
+        # What the acceptance re-run ran under: the lane's recorded launch PATH, or ``None`` when
+        # the lane has none and the runner's ambient environment was inherited. Recorded so a
+        # reader can tell which environment a passing re-run actually saw.
+        "unit_path": str(lane.get(UNIT_PATH_FIELD) or "").strip() or None,
         "test_exit_code": exit_code,
         "test_result": "pass",
         "test_output_tail": tail,

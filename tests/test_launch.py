@@ -22,6 +22,7 @@ import pytest
 
 import advance
 import launch
+import oprun
 from ledger import (
     BLOCKED,
     COMPLETED,
@@ -39,6 +40,15 @@ TEST_FAIL = [sys.executable, "-c", "print('boom'); raise SystemExit(1)"]
 
 #: A program that exists nowhere: the controller cannot START this command (issue #1's ENOENT).
 TEST_ENOENT = ["oprun-no-such-program-xyz"]
+
+#: A tool that exists in ONE directory and nowhere else on this host — the bare name resolves only
+#: when the acceptance re-run runs under a PATH that contains that directory. That is exactly the
+#: asymmetry ``unit_path`` removes: the worker's unit was pinned with such a PATH, the controller's
+#: own PATH is a different variable.
+BARE_TOOL_NAME = "oprun-path-parity-tool"
+
+#: Prints the PATH the re-run actually handed the child, so the environment is observable output.
+PRINT_PATH_TEST_CMD = [sys.executable, "-c", "import os; print(os.environ.get('PATH'))"]
 
 
 # --- fixtures ----------------------------------------------------------------
@@ -496,6 +506,118 @@ def test_a_red_controller_test_is_still_a_failure_and_still_counts(tmp_path: Pat
     assert lane["consecutive_failures"] == 1, "a red test still moves the breaker"
     assert lane["infra"] == [], "a red test is not an infra outcome"
     assert "test re-run failed" in lane["needs_review_reason"]
+
+
+# --- the PATH the acceptance re-run happens under ----------------------------
+# ``launch.py`` pins a PATH onto every worker unit and dispatch records that reported value on the
+# lane; the runner's own re-run must use it, or the worker's PATH and the controller's PATH are
+# different variables by construction and the acceptance re-run can ENOENT a tool the worker used.
+
+
+def _bare_tool(directory: Path, name: str = BARE_TOOL_NAME) -> Path:
+    """An executable reachable by its bare name only from ``directory`` (or another PATH entry)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    tool = directory / name
+    tool.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(0)\n", encoding="utf-8")
+    tool.chmod(0o755)
+    return tool
+
+
+def _record_unit_path(ledger: Ledger, lane_id: str, unit_path: str) -> None:
+    """Record a launch PATH on the lane through the SHIPPED writer, exactly as dispatch does."""
+    oprun._record_unit_path(ledger.path, lane_id, unit_path)
+    assert ledger.lane(lane_id)[advance.UNIT_PATH_FIELD] == unit_path
+
+
+def test_advance_reruns_the_test_cmd_under_the_lanes_recorded_path(tmp_path: Path) -> None:
+    """The lane's tool resolves for the controller because the re-run uses the WORKER's PATH."""
+    tool_dir = tmp_path / "lane-tools"
+    _bare_tool(tool_dir)
+    ledger, worktree = _ledger_with_lane(tmp_path, test_cmd=[BARE_TOOL_NAME])
+    dispatch_id = ledger.dispatch("alpha")
+    _sidecar(worktree, dispatch_id)
+    _record_unit_path(ledger, "alpha", str(tool_dir))
+    lines: list[str] = []
+
+    summary = advance.advance(ledger.path, timeout=5, poll=0.05, emit=lines.append)
+
+    lane = ledger.lane("alpha")
+    assert summary["accepted"] == ["alpha"], lines
+    assert lane["status"] == COMPLETED
+    assert lane["evidence"]["test_exit_code"] == 0
+    assert lane["evidence"]["unit_path"] == str(tool_dir)
+
+
+def test_advance_without_the_recorded_path_cannot_start_the_same_test_cmd(tmp_path: Path) -> None:
+    """The control, and the measured asymmetry: without the recording it is rc 127 — ``infra``.
+
+    Not a red test: the command never ran, so the lane goes back to ``ready`` with its failure
+    streak untouched (issue #1). Recording the PATH is what removes the asymmetry; inventing one
+    would be a different fix, and this asserts the fallback stays the ambient environment.
+    """
+    tool_dir = tmp_path / "lane-tools"
+    _bare_tool(tool_dir)
+    ledger, worktree = _ledger_with_lane(tmp_path, test_cmd=[BARE_TOOL_NAME])
+    dispatch_id = ledger.dispatch("alpha")
+    _sidecar(worktree, dispatch_id)
+    lines: list[str] = []
+
+    summary = advance.advance(ledger.path, timeout=5, poll=0.05, emit=lines.append)
+
+    lane = ledger.lane("alpha")
+    assert summary["accepted"] == [], lines
+    assert lane["status"] == READY, "an unrunnable command is an environment fault, not a lane"
+    assert lane["consecutive_failures"] == 0
+    assert lane["infra"][0]["evidence"]["test_exit_code"] == 127
+
+
+def test_advance_passes_exactly_the_recorded_path_to_the_test_cmd(tmp_path: Path) -> None:
+    """Verbatim, and nothing else: the re-run gets the recorded PATH with no additions."""
+    recorded = "/opt/lane-tools:/usr/bin:/bin"
+    ledger, worktree = _ledger_with_lane(tmp_path, test_cmd=list(PRINT_PATH_TEST_CMD))
+    dispatch_id = ledger.dispatch("alpha")
+    _sidecar(worktree, dispatch_id)
+    _record_unit_path(ledger, "alpha", recorded)
+
+    summary = advance.advance(ledger.path, timeout=5, poll=0.05, emit=lambda _line: None)
+
+    lane = ledger.lane("alpha")
+    assert summary["accepted"] == ["alpha"]
+    assert lane["evidence"]["unit_path"] == recorded
+    assert lane["evidence"]["test_output_tail"].strip() == recorded
+
+
+def test_advance_without_a_recorded_path_reruns_with_the_ambient_environment(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Back-compat: a ledger written before ``unit_path`` existed keeps its old environment.
+
+    ``env=None`` is what "inherit the ambient environment" means, so a tool reachable only through
+    the ambient PATH still resolves for the re-run — asserted behaviourally (the tool runs), not by
+    long-string equality of a PATH that the evidence tail may truncate.
+    """
+    tool_dir = tmp_path / "ambient-tools"
+    _bare_tool(tool_dir)
+    ambient = [entry for entry in (os.environ.get("PATH") or "").split(os.pathsep) if entry]
+    monkeypatch.setenv("PATH", os.pathsep.join((str(tool_dir), *ambient)))
+
+    ledger, worktree = _ledger_with_lane(tmp_path, test_cmd=[BARE_TOOL_NAME])
+    dispatch_id = ledger.dispatch("alpha")
+    _sidecar(worktree, dispatch_id)
+
+    summary = advance.advance(ledger.path, timeout=5, poll=0.05, emit=lambda _line: None)
+
+    lane = ledger.lane("alpha")
+    assert summary["accepted"] == ["alpha"]
+    assert lane["evidence"]["unit_path"] is None
+    assert lane["evidence"]["test_exit_code"] == 0
+
+
+def test_the_rerun_env_invents_nothing_for_an_absent_path() -> None:
+    """``None`` (or blank) is "inherit", never a fabricated PATH: no defaults, no resolution."""
+    assert advance._test_cmd_env(None) is None
+    assert advance._test_cmd_env("") is None
+    assert advance._test_cmd_env("   ") is None
+    assert advance._test_cmd_env("/venv/bin") == {**os.environ, "PATH": "/venv/bin"}
 
 
 def test_advance_never_accepts_a_sidecar_naming_a_superseded_dispatch(tmp_path: Path) -> None:
