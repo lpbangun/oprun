@@ -22,14 +22,17 @@ from ledger import (  # noqa: E402
     DEPTH_EXCEEDED_TOKEN,
     DISPATCHED,
     FAILED,
+    PARKED,
     PENDING,
     READY,
+    TERMINAL,
+    TRANSITIONS,
     DepthExceeded,
     IllegalTransition,
     Ledger,
     ParallelismExceeded,
-    TERMINAL,
     apply,
+    display_state,
     normalize_model,
 )
 
@@ -327,6 +330,90 @@ class TestLedgerCase:
         """A worker must not be able to write the ledger without a fenced transition."""
         assert not hasattr(led, "save")
         assert not hasattr(led, "write")
+
+
+# --- the parked display state (issue #2) --------------------------------------
+#: The evidence a ``settle --needs-review`` / refused ``--accept`` leaves: the verdict word is the
+#: one thing that separates "waiting for a decision" from "this dispatch failed".
+PARKED_EVIDENCE = {"controller": "oprun-settle", "verdict": "needs_review", "reason": "flaky test"}
+
+
+class TestParkedDisplay:
+    """``parked`` is a word a reader sees, never a state the machine holds."""
+
+    @pytest.fixture()
+    def led(self, tmp_path):
+        return Ledger(tmp_path / "state.json", failure_limit=3)
+
+    def test_needs_review_settle_displays_parked(self, led):
+        _init(led, "lane-a")
+        d1 = led.dispatch("lane-a")
+        assert led.settle("lane-a", d1, ok=False, evidence=PARKED_EVIDENCE,
+                          reason="flaky test")["accepted"]
+
+        lane = led.lane("lane-a")
+        # the stored state is untouched: still FAILED, still terminal, still fenced
+        assert lane["status"] == FAILED
+        assert lane["status"] in TERMINAL
+        assert led.summary() == {FAILED: 1}
+        assert display_state(lane) == PARKED
+        # ...and `parked` is not reachable AS a state, so nothing can transition through it
+        assert PARKED not in TERMINAL
+        assert PARKED not in set(TRANSITIONS.values())
+        with pytest.raises(IllegalTransition):
+            apply(PARKED, "retry")
+        with pytest.raises(IllegalTransition):
+            apply(PARKED, "success")
+        # the fence is untouched by the display word: a superseded token still cannot settle
+        d2 = led.dispatch("lane-a")
+        assert d2 == "lane-a-d2"
+        stale = led.settle("lane-a", d1, ok=False, reason="late delivery")
+        assert not stale["accepted"] and "stale dispatch" in stale["reason"]
+
+    def test_display_state_keeps_failed_and_blocked_distinct(self, tmp_path):
+        led = Ledger(tmp_path / "state.json", failure_limit=2)
+        # a lane `advance` failed for its own reason (red test / unusable artifact): its verdict is
+        # the witness's word, not `needs_review`, so it keeps the honest `failed`
+        _init(led, "advance-failed")
+        d = led.dispatch("advance-failed")
+        assert led.settle("advance-failed", d, ok=False, reason="test rc=1",
+                          evidence={"controller": "advance", "verdict": "failed",
+                                    "rejected_because": "test rc=1"})["accepted"]
+        assert display_state(led.lane("advance-failed")) == FAILED
+
+        # the circuit breaker outranks the label: a lane parked twice is BLOCKED, not merely parked
+        _init(led, "breaker")
+        for _ in range(2):
+            pending = led.dispatch("breaker")
+            led.settle("breaker", pending, ok=False, evidence=PARKED_EVIDENCE, reason="flaky")
+        breaker = led.lane("breaker")
+        assert breaker["status"] == BLOCKED
+        assert display_state(breaker) == BLOCKED
+        assert display_state(breaker) != PARKED
+
+    def test_display_state_is_the_plain_status_for_anything_else(self, led):
+        _init(led, "lane-a")
+        assert display_state(led.lane("lane-a")) == PENDING
+        d = led.dispatch("lane-a")
+        assert display_state(led.lane("lane-a")) == DISPATCHED
+        assert led.settle("lane-a", d, ok=True,
+                          evidence={"controller": "oprun-settle", "verdict": "accepted"})["accepted"]
+        assert display_state(led.lane("lane-a")) == COMPLETED
+
+    def test_lane_records_the_merge_target_it_was_dispatched_into(self, led):
+        """``dispatch --into`` is recorded ON the lane, so settle can refuse a wrong checkout."""
+        _init(led, "plain")
+        assert led.lane("plain")["merge_into"] is None, "no target recorded means no target"
+        _init(led, "targeted", merge_into="main")
+        assert led.lane("targeted")["merge_into"] == "main"
+        # an explicit re-dispatch replaces the target; a dispatch without --into leaves it alone
+        _init(led, "targeted", merge_into="release")
+        assert led.lane("targeted")["merge_into"] == "release"
+        _init(led, "targeted")
+        assert led.lane("targeted")["merge_into"] == "release"
+        # the record survives dispatch and settle untouched
+        assert led.dispatch("targeted") == "targeted-d1"
+        assert led.lane("targeted")["merge_into"] == "release"
 
 
 if __name__ == "__main__":

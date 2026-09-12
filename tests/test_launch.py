@@ -22,20 +22,34 @@ import pytest
 
 import advance
 import launch
-from ledger import BLOCKED, COMPLETED, DISPATCHED, FAILED, IllegalTransition, Ledger
+from ledger import (
+    BLOCKED,
+    COMPLETED,
+    DEFAULT_INFRA_LIMIT,
+    DISPATCHED,
+    FAILED,
+    READY,
+    IllegalTransition,
+    Ledger,
+)
 
 #: A test command that passes, and one that fails, run through the same interpreter as the suite.
 TEST_PASS = [sys.executable, "-c", "raise SystemExit(0)"]
 TEST_FAIL = [sys.executable, "-c", "print('boom'); raise SystemExit(1)"]
+
+#: A program that exists nowhere: the controller cannot START this command (issue #1's ENOENT).
+TEST_ENOENT = ["oprun-no-such-program-xyz"]
 
 
 # --- fixtures ----------------------------------------------------------------
 
 
 def _ledger_with_lane(tmp_path: Path, lane_id: str = "alpha", *, test_cmd: list[str] | None = None,
-                      failure_limit: int = 3) -> tuple[Ledger, Path]:
+                      failure_limit: int = 3,
+                      infra_limit: int = DEFAULT_INFRA_LIMIT) -> tuple[Ledger, Path]:
     """A real ledger plus a real lane with a real worktree — no mocks anywhere."""
-    ledger = Ledger(tmp_path / f"{lane_id}-state.json", failure_limit=failure_limit)
+    ledger = Ledger(tmp_path / f"{lane_id}-state.json", failure_limit=failure_limit,
+                    infra_limit=infra_limit)
     worktree = tmp_path / f"wt-{lane_id}"
     worktree.mkdir(parents=True, exist_ok=True)
     ledger.init_lane(lane_id, harness="cursor-agent", worktree=str(worktree),
@@ -75,6 +89,22 @@ def _systemd_user_available() -> bool:
     return proc.returncode == 0
 
 
+def _wait_for_report(path: Path, *, seconds: float = 20.0) -> str:
+    """Poll for a file a detached unit writes about ITSELF, and return its text (``\"\"`` on timeout).
+
+    Bounded: the unit is detached, so there is no process to join and no exit status to read after
+    ``--collect`` removed it — the unit's own output on disk is the only honest witness.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        time.sleep(0.1)
+    return ""
+
+
 # --- launch.py: the detach story, asserted on the argv -----------------------
 
 
@@ -99,6 +129,49 @@ def test_build_systemd_run_argv_pins_home_and_extra_env(tmp_path: Path) -> None:
     assert f"--setenv=HOME={launch.REAL_HOME}" in argv
     assert "--setenv=OPRUN_LANE=alpha" in argv
     assert "--setenv=HOME=/wrong" not in argv, "HOME cannot be overridden by a caller"
+
+
+def test_build_systemd_run_argv_carries_the_resolved_path_onto_the_unit(tmp_path: Path) -> None:
+    """Issue #1: a systemd user unit gets no login shell, so PATH has to be carried onto it.
+
+    A lane whose ``test_cmd`` names its tool by the bare name (``npx``, ``node``, ``npm``) died
+    ENOENT inside the unit, which the controller read as rc 127 — a failed test. The unit now starts
+    with the conductor's resolved PATH, so a bare name resolves there exactly as it does here.
+    """
+    workdir = tmp_path / "wt"
+    argv = launch.build_systemd_run_argv("oprun-alpha", ["/bin/true"], workdir)
+
+    pinned = [item for item in argv if item.startswith("--setenv=PATH=")]
+    assert len(pinned) == 1, argv
+    value = pinned[0].split("=", 2)[2]
+    assert value, "an empty PATH is the ENOENT failure mode itself"
+
+    entries = value.split(os.pathsep)
+    conductor = [entry for entry in (os.environ.get("PATH") or "").split(os.pathsep) if entry]
+    assert entries[:len(conductor)] == conductor, "the conductor's own entries keep precedence"
+    for entry in launch.SYSTEM_PATH_ENTRIES:
+        assert entry in entries, f"{entry} must be reachable inside the unit"
+    assert shutil.which("sh", path=value) is not None, "a bare tool name must resolve under the pin"
+
+    # ...and the HOME pin is still exactly what it was.
+    assert f"--setenv=HOME={launch.REAL_HOME}" in argv
+    assert "--setenv=HOME=/wrong" not in argv
+
+
+def test_worker_path_never_returns_empty_and_honours_an_explicit_override(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", "/opt/lane-tools")
+    assert launch.worker_path() == os.pathsep.join(("/opt/lane-tools", *launch.SYSTEM_PATH_ENTRIES))
+
+    # A caller may pin a narrow PATH on purpose (a venv's bin, say): the override is used verbatim —
+    # the one place a caller overrides the pin, unlike HOME where a sandboxed value is always a bug.
+    assert launch.worker_path({"PATH": "/venv/bin"}) == "/venv/bin"
+    assert "--setenv=PATH=/venv/bin" in launch.build_systemd_run_argv(
+        "oprun-alpha", ["/bin/true"], Path("/tmp"), {"PATH": "/venv/bin"})
+
+    monkeypatch.delenv("PATH", raising=False)
+    assert launch.worker_path() == os.pathsep.join(launch.SYSTEM_PATH_ENTRIES)
+    assert launch.worker_path({}) == os.pathsep.join(launch.SYSTEM_PATH_ENTRIES)
 
 
 def test_build_systemd_run_argv_uses_no_shell_detach_shims(tmp_path: Path) -> None:
@@ -158,6 +231,48 @@ def test_launch_lands_a_real_unit_outside_the_session_scope(tmp_path: Path) -> N
     finally:
         launch.stop(unit)
     assert launch.unit_status(unit)["active"] is False
+
+
+@pytest.mark.skipif(not _systemd_user_available() or shutil.which("npx") is None,
+                    reason="needs a live systemd user session and a bare npx on PATH")
+def test_a_bare_tool_name_resolves_inside_a_launched_unit(tmp_path: Path) -> None:
+    """Live proof of issue #1's fix: the UNIT itself resolves ``npx`` by its bare name.
+
+    The unit writes down what *it* resolved — ``command -v npx`` runs inside the unit, never here —
+    and the very same command is launched twice: once with the pinned PATH, once with a deliberately
+    poisoned one. Only the pin makes the bare name resolve, and the poisoned control is exactly the
+    environment every systemd unit used to start in.
+    """
+    workdir = tmp_path / "wt"
+    workdir.mkdir()
+    script = ("resolved=$(command -v npx || echo NOT-FOUND); "
+              "printf '%s\\n' \"$resolved\" > \"$OPRUN_UNIT_REPORT\"")
+    expected = shutil.which("npx")
+    assert expected is not None                     # the skipif above just proved it
+
+    pinned_report = tmp_path / "unit-path-pinned.txt"
+    pinned_unit = launch.unit_name(f"pathcheck-{os.getpid()}")
+    launch.stop(pinned_unit)
+    try:
+        started = launch.launch(pinned_unit, ["/bin/sh", "-c", script], workdir=workdir,
+                                env={"OPRUN_UNIT_REPORT": str(pinned_report)})
+        assert started["started"] is True, started["detail"]
+        assert started["path"] == launch.worker_path(), "the launch reports the PATH it pinned"
+        assert _wait_for_report(pinned_report) == expected
+    finally:
+        launch.stop(pinned_unit)
+
+    poisoned_report = tmp_path / "unit-path-poisoned.txt"
+    poisoned_unit = launch.unit_name(f"pathcheck-bad-{os.getpid()}")
+    launch.stop(poisoned_unit)
+    try:
+        started = launch.launch(poisoned_unit, ["/bin/sh", "-c", script], workdir=workdir,
+                                env={"OPRUN_UNIT_REPORT": str(poisoned_report),
+                                     "PATH": "/nonexistent"})
+        assert started["started"] is True, started["detail"]
+        assert _wait_for_report(poisoned_report) == "NOT-FOUND"
+    finally:
+        launch.stop(poisoned_unit)
 
 
 # --- advance.py: acceptance is evidence, and the loop is bounded -------------
@@ -258,6 +373,129 @@ def test_advance_stops_at_the_breaker_and_never_retries_a_parked_lane(tmp_path: 
     assert ledger.lane("alpha")["attempt"] == 3
     with pytest.raises(IllegalTransition):
         ledger.dispatch("alpha")
+
+
+# --- infra: the controller could not RUN the command (issue #1) ---------------
+
+
+def test_ledger_infra_settlement_returns_the_lane_to_ready_and_never_touches_the_streak(
+        tmp_path: Path) -> None:
+    """``settle(infra=True)`` is the one settlement that is not an outcome of the lane."""
+    ledger, _ = _ledger_with_lane(tmp_path)
+    dispatch_id = ledger.dispatch("alpha")
+
+    outcome = ledger.settle("alpha", dispatch_id, False, evidence={"verdict": "infra"},
+                            reason="test command could not run", infra=True)
+
+    lane = ledger.lane("alpha")
+    assert outcome["accepted"] is True and outcome["infra_count"] == 1
+    assert lane["status"] == READY, "ready: the ordinary dispatch gate re-enters it"
+    assert lane["consecutive_failures"] == 0, "the breaker counts red tests, never an ENOENT"
+    assert lane["infra"][0]["dispatch_id"] == dispatch_id
+    assert lane["infra"][0]["evidence"]["verdict"] == "infra"
+    assert "infra" in {entry["event"] for entry in lane["history"]}
+    assert dispatch_id not in lane["accepted"], "an infra outcome is not a settled success"
+    assert "needs_review_reason" not in lane, "an infra outcome is not a review park"
+
+    # exactly-once still holds: the same token cannot settle the lane twice
+    again = ledger.settle("alpha", dispatch_id, False, reason="again", infra=True)
+    assert again["accepted"] is False and "not dispatched" in again["reason"]
+
+    # ...and an infra outcome can never be an acceptance
+    dispatch_id = ledger.dispatch("alpha")
+    with pytest.raises(ValueError):
+        ledger.settle("alpha", dispatch_id, True, infra=True)
+
+    # the shipped cap is wired through the constructor (``advance`` reports it on the retry line)
+    assert Ledger(tmp_path / "cap-state.json").infra_limit == DEFAULT_INFRA_LIMIT
+
+
+def test_advance_records_an_enoent_test_cmd_as_infra_and_leaves_the_breaker_alone(
+        tmp_path: Path) -> None:
+    """Issue #1's second half: rc 127 is an environment fault, never a red test.
+
+    The sidecar is valid and the lane's tests were never proven red — the program simply is not on
+    this host — so the lane goes back to ``ready`` (re-dispatchable through the ordinary gate, which
+    is what relaunches its worker) with its failure streak untouched, and the attempt is recorded in
+    ``lane["infra"]`` so the fault is visible in the ledger itself, not only in stdout.
+    """
+    ledger, worktree = _ledger_with_lane(tmp_path, test_cmd=TEST_ENOENT)
+    dispatch_id = ledger.dispatch("alpha")
+    _sidecar(worktree, dispatch_id)
+    lines: list[str] = []
+
+    summary = advance.advance(ledger.path, timeout=5, poll=0.05, emit=lines.append)
+
+    lane = ledger.lane("alpha")
+    assert summary["accepted"] == [], "an unrunnable command can never be an acceptance"
+    assert summary["needs_review"] == [], "an environment fault is not a lane for review"
+    assert summary["stalled"] == [] and summary["timed_out"] == []
+    assert summary["final"] == {READY: 1}
+    assert lane["status"] == READY
+    assert lane["status"] != COMPLETED
+    assert lane["status"] != DISPATCHED, "the dispatch is over: the lane is ready to be re-dispatched"
+    assert lane["consecutive_failures"] == 0, "the breaker counts red tests, never an ENOENT"
+    assert len(lane["infra"]) == 1
+    record = lane["infra"][0]
+    assert record["dispatch_id"] == dispatch_id
+    assert TEST_ENOENT[0] in record["reason"]
+    assert record["evidence"]["outcome"] == "infra"
+    assert record["evidence"]["test_exit_code"] == 127
+    assert any("INFRA_RETRY" in line for line in lines)
+    assert not any("NEEDS_REVIEW" in line for line in lines)
+
+    # ...and the lane really is re-dispatchable: the ordinary gate gives it a fresh token.
+    assert ledger.dispatch("alpha") != dispatch_id
+
+
+def test_advance_parks_after_the_infra_limit_with_the_breaker_still_untouched(
+        tmp_path: Path) -> None:
+    """A permanently unrunnable command must reach a human — without ever counting as a red test.
+
+    Two infra outcomes (the ``infra_limit`` here) and the lane is parked ``blocked`` with a reason
+    that names the ENVIRONMENT, not the circuit breaker: the lane's tests never ran, so its failure
+    streak stays at zero even as it is parked for review.
+    """
+    ledger, worktree = _ledger_with_lane(tmp_path, test_cmd=TEST_ENOENT, infra_limit=2)
+    lines: list[str] = []
+
+    dispatch_id = ledger.dispatch("alpha")
+    _sidecar(worktree, dispatch_id)
+    advance.advance(ledger.path, timeout=5, poll=0.05, emit=lines.append)
+    first = ledger.lane("alpha")
+    assert first["status"] == READY and len(first["infra"]) == 1
+    assert first["consecutive_failures"] == 0
+
+    dispatch_id = ledger.dispatch("alpha")        # the conductor's explicit re-dispatch
+    _sidecar(worktree, dispatch_id)
+    summary = advance.advance(ledger.path, timeout=5, poll=0.05, emit=lines.append)
+
+    parked = ledger.lane("alpha")
+    assert parked["status"] == BLOCKED
+    assert len(parked["infra"]) == 2
+    assert parked["consecutive_failures"] == 0, "the infra park never touches the failure streak"
+    assert parked["blocked_reason"].startswith("infra")
+    assert "circuit breaker" not in parked["blocked_reason"]
+    assert "alpha" in summary["needs_review"]
+    assert any("NEEDS_REVIEW infra" in line for line in lines)
+    with pytest.raises(IllegalTransition):
+        ledger.dispatch("alpha")
+
+
+def test_a_red_controller_test_is_still_a_failure_and_still_counts(tmp_path: Path) -> None:
+    """The other side of the split: a test that RAN and failed keeps exactly its old meaning."""
+    ledger, worktree = _ledger_with_lane(tmp_path, test_cmd=TEST_FAIL)
+    dispatch_id = ledger.dispatch("alpha")
+    _sidecar(worktree, dispatch_id)
+
+    summary = advance.advance(ledger.path, timeout=5, poll=0.05, emit=lambda _line: None)
+
+    lane = ledger.lane("alpha")
+    assert lane["status"] == FAILED
+    assert "alpha" in summary["needs_review"]
+    assert lane["consecutive_failures"] == 1, "a red test still moves the breaker"
+    assert lane["infra"] == [], "a red test is not an infra outcome"
+    assert "test re-run failed" in lane["needs_review_reason"]
 
 
 def test_advance_never_accepts_a_sidecar_naming_a_superseded_dispatch(tmp_path: Path) -> None:

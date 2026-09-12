@@ -26,6 +26,12 @@ from ledger import BLOCKED, DISPATCHED, FAILED, Ledger
 GREEN_TEST_CMD = [sys.executable, "-c", "raise SystemExit(0)"]
 RED_TEST_CMD = [sys.executable, "-c", "raise SystemExit(3)"]
 
+#: A program that exists nowhere: the controller cannot START the command at all. This is the
+#: environment failing (issue #1's ENOENT), never the lane's tests failing.
+ENOENT_TEST_CMD = ["oprun-no-such-program-xyz"]
+#: A command that outlives the controller's own budget, for the timeout half of the same rule.
+SLOW_TEST_CMD = [sys.executable, "-c", "import time; time.sleep(30)"]
+
 CLAUDE_CANARY_403 = (
     '{"is_error":true,"subtype":"success","api_error_status":403,"type":"result",'
     '"terminal_reason":"api_error","result":"Failed to authenticate. API Error: 403 Access to '
@@ -92,7 +98,15 @@ def run_probe(lane: dict, *, unit_active: bool = False, timeout_exceeded: bool =
 
 # --- vocabulary --------------------------------------------------------------
 def test_verdict_vocabulary_is_frozen() -> None:
-    assert probe.VERDICTS == ("done", "pending", "needs_input", "stalled", "failed")
+    """The vocabulary is closed: exactly these words, and ``infra`` is the one issue #1 added.
+
+    ``infra`` is not a lane outcome at all — it says the controller could not RUN the lane's
+    acceptance command (ENOENT, not executable, or its own budget ran out), so no test was proven
+    either way. It is kept apart from ``failed``/``needs_input`` because an environment fault must
+    never be read as a red test.
+    """
+    assert probe.VERDICTS == ("done", "infra", "pending", "needs_input", "stalled", "failed")
+    assert len(set(probe.VERDICTS)) == len(probe.VERDICTS), "one word per verdict, no aliases"
 
 
 def test_every_verdict_returned_is_in_the_vocabulary(tmp_path: Path) -> None:
@@ -264,6 +278,85 @@ def test_lane_without_test_cmd_is_never_done(tmp_path: Path) -> None:
     lane = make_lane(tmp_path, worktree=worktree, test_cmd=[])
     write_sidecar(worktree, "lane-a-d1")
     assert run_probe(lane)["verdict"] == "needs_input"
+
+
+# --- infra: the controller could not RUN the command (issue #1) ---------------
+def test_enoent_test_cmd_is_infra_never_failed(tmp_path: Path) -> None:
+    """Issue #1: a command the controller cannot START is ``infra``, never ``failed``.
+
+    The lane's sidecar is good and its tests were never proven red — the program simply is not on
+    this host. Reading that as a lane failure parks the lane and strikes the circuit breaker for
+    something the lane never did, which is the bug this verdict exists to prevent.
+    """
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=ENOENT_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "infra", result
+    assert result["verdict"] != "failed"
+    assert result["verdict"] != "done"
+    assert result["verdict"] != "needs_input", "an ENOENT is not 'a human must decide on evidence'"
+    assert result["evidence"]["test_rc"] == probe.TEST_CMD_NOT_RUNNABLE_RC == 127
+    assert ENOENT_TEST_CMD[0] in result["evidence"]["infra_reason"]
+
+
+def test_enoent_test_cmd_leaves_the_sidecar_evidence_untouched(tmp_path: Path) -> None:
+    """The infra verdict is about the environment only: every artifact check still ran and passed."""
+    worktree = make_worktree(tmp_path)
+    (worktree / "stats.py").write_text("mean = 1\n")
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=ENOENT_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1", files=("stats.py",))
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "infra"
+    assert result["evidence"]["sidecar_present"] is True
+    assert result["evidence"]["sidecar_status"] == "success"
+    assert result["evidence"]["missing_evidence_paths"] == []
+
+
+def test_timed_out_test_cmd_is_infra_never_failed(tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of the same rule: the controller's own budget killing the run is not a test."""
+    monkeypatch.setattr(probe, "TEST_CMD_TIMEOUT_SECONDS", 0.5)
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=SLOW_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "infra", result
+    assert result["verdict"] != "failed"
+    assert result["evidence"]["test_rc"] == probe.TEST_CMD_TIMEOUT_RC == 124
+    assert "timed out" in result["evidence"]["infra_reason"]
+
+
+def test_a_red_test_cmd_is_never_infra(tmp_path: Path) -> None:
+    """The line the fix must not blur: a test that RAN and failed stays a decision for a human."""
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree, test_cmd=RED_TEST_CMD)
+    write_sidecar(worktree, "lane-a-d1")
+
+    result = run_probe(lane, unit_active=False)
+
+    assert result["verdict"] == "needs_input"
+    assert result["verdict"] != "infra"
+    assert result["evidence"]["test_rc"] == 3
+    assert result["evidence"].get("infra_reason") is None
+
+
+def test_run_test_cmd_separates_infra_from_a_red_test(tmp_path: Path) -> None:
+    """The classifier itself, at the level the controller calls it."""
+    rc, _tail, infra_reason = probe._run_test_cmd(ENOENT_TEST_CMD, tmp_path)
+    assert rc == 127 and infra_reason
+
+    rc, _tail, infra_reason = probe._run_test_cmd(RED_TEST_CMD, tmp_path)
+    assert rc == 3 and infra_reason == "", "a red test carries no infra reason"
+
+    rc, _tail, infra_reason = probe._run_test_cmd(GREEN_TEST_CMD, tmp_path)
+    assert rc == 0 and infra_reason == ""
 
 
 def test_unreadable_sidecar_is_needs_input(tmp_path: Path) -> None:
