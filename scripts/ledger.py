@@ -330,9 +330,17 @@ class Ledger:
     def _blank_lane(*, harness: str, worktree: str, test_cmd: list[str],
                     model: str | None, depends_on: list[str] | None,
                     parent_dispatch: str | None, depth: int,
-                    merge_into: str | None = None) -> dict:
+                    merge_into: str | None = None,
+                    test_timeout_s: float | None = None) -> dict:
         """A complete lane record. Every field is always present on every lane."""
         return {
+            #: The acceptance budget this lane DECLARED at dispatch, in seconds — or ``None`` when it
+            #: declared none (a lane whose ledger predates the field), which every acceptance path
+            #: then reads as the shipped default. Immutable after dispatch: only ``init_lane``'s
+            #: dispatch-time argument can write it, and every re-run site READS it instead of
+            #: carrying a constant of its own. Recorded here as the value the caller resolved, never
+            #: as a policy: the ledger holds the number, the modules hold the rule.
+            "test_timeout_s": test_timeout_s,
             "status": PENDING,
             "harness": harness,
             "worktree": worktree,
@@ -360,6 +368,12 @@ class Ledger:
             #: of them touches ``consecutive_failures``. The list is also the ledger's bound: at
             #: ``infra_limit`` entries the lane is parked for review (issue #1).
             "infra": [],
+            #: Every **over_budget** outcome for this lane, in order: ``{dispatch_id, reason,
+            #: evidence, at}``. Over budget means the lane's own recorded acceptance budget ran out
+            #: before its ``test_cmd`` reached a verdict: not a red test (so never a strike on the
+            #: breaker) and not an environment fault (so never an ``infra`` retry) — the lane parks.
+            #: Kept apart from ``infra`` on purpose: two clocks, two words, two outcomes.
+            "over_budget": [],
             "accepted": [],              # dispatch ids whose settlement was accepted
             "rejected": [],              # {dispatch_id, reason, at}
             "evidence": {},
@@ -382,7 +396,8 @@ class Ledger:
     def init_lane(self, lane_id: str, *, harness: str, worktree: str, test_cmd: list[str],
                   model: str | None = None, depends_on: list[str] | None = None,
                   parent_dispatch: str | None = None, depth: int = 0,
-                  merge_into: str | None = None) -> dict:
+                  merge_into: str | None = None,
+                  test_timeout_s: float | None = None) -> dict:
         """Create a lane. Idempotent: an existing lane is returned untouched.
 
         Raises :class:`DepthExceeded` when ``depth > max_depth`` — depth is a hard ceiling
@@ -393,6 +408,12 @@ class Ledger:
         the work lands), while passing nothing leaves whatever was recorded before. ``None`` means
         "not recorded", and ``settle --accept`` then merges into whatever the primary worktree has
         checked out, exactly as before ``--into`` existed.
+
+        ``test_timeout_s`` is the lane's acceptance budget, resolved by the caller at dispatch. It
+        follows the opposite rule to ``merge_into`` for a re-dispatch: explicit replaces, absent
+        never clears — so a lane's declared budget cannot silently reset to a default just because
+        the conductor dispatched it again without repeating the flag. ``None`` means the lane
+        declared no budget of its own, and every acceptance path then reads the shipped default.
         """
         if depth > self.max_depth:
             raise DepthExceeded(
@@ -402,7 +423,7 @@ class Ledger:
         record = self._blank_lane(harness=harness, worktree=worktree, test_cmd=test_cmd,
                                   model=model, depends_on=depends_on,
                                   parent_dispatch=parent_dispatch, depth=depth,
-                                  merge_into=merge_into)
+                                  merge_into=merge_into, test_timeout_s=test_timeout_s)
         with self._locked():
             lane = self.data["lanes"].setdefault(lane_id, record)
             # every record carries every field, even one hand-edited outside this module
@@ -410,6 +431,11 @@ class Ledger:
                 lane.setdefault(key, value)
             if merge_into:
                 lane["merge_into"] = merge_into
+            # An explicit dispatch-time budget REPLACES whatever was recorded (the conductor
+            # re-stating this lane's acceptance contract); passing none leaves it exactly as it was,
+            # so a re-dispatch can never silently reset a lane's declared budget to the default.
+            if test_timeout_s is not None:
+                lane["test_timeout_s"] = float(test_timeout_s)
             self._write()
             return lane
 
@@ -460,7 +486,8 @@ class Ledger:
             return lane["dispatch_id"]
 
     def settle(self, lane_id: str, dispatch_id: str, ok: bool,
-               evidence: dict | None = None, reason: str = "", infra: bool = False) -> dict:
+               evidence: dict | None = None, reason: str = "", infra: bool = False,
+               over_budget: bool = False) -> dict:
         """Accept or reject one dispatch's outcome, and apply the circuit breaker.
 
         Fencing runs FIRST, before the duplicate check: a superseded dispatch is stale
@@ -485,9 +512,26 @@ class Ledger:
         ``blocked_reason`` naming the environment, so a permanently unrunnable command reaches a
         human instead of being retried forever; that park touches no failure streak either.
         Returns that settlement with an extra ``infra_count``.
+
+        ``over_budget=True`` is the other settlement that is not an outcome of the lane, and it is a
+        different clock from ``infra``: the lane's ``test_cmd`` started, but it outran the acceptance
+        budget the lane itself RECORDED at dispatch (``test_timeout_s``), so it never reached a
+        verdict. Nothing failed in the environment (never ``infra``, never an ``infra`` retry) and no
+        test was proven red (never a strike on the breaker) — so the lane parks ``blocked`` with a
+        ``blocked_reason`` naming ``over_budget``, its ``consecutive_failures`` is left untouched,
+        and the outcome is recorded in ``lane["over_budget"]``. Parked is the point: the budget it
+        declared has already proved too small, and a silent re-run of the same unchanged command
+        would blow it again. Returns that settlement with an extra ``over_budget_count``.
         """
         if infra and ok:
             raise ValueError("infra=True means no test verdict was reached: it cannot accept a lane")
+        if over_budget and ok:
+            raise ValueError(
+                "over_budget=True means no test verdict was reached: it cannot accept a lane")
+        if infra and over_budget:
+            raise ValueError(
+                "an attempt is either the environment failing (infra) or the lane's own recorded "
+                "budget running out (over_budget), never both")
         with self._locked():
             lane = self._lane(lane_id)
 
@@ -510,6 +554,27 @@ class Ledger:
             # the lane must still be mid-flight for a settlement to mean anything
             if lane["status"] != DISPATCHED:
                 return reject(f"lane is {lane['status']!r}, not dispatched")
+
+            if over_budget:
+                # A park that is deliberately NOT the failure transition: the lane's tests never
+                # reached a verdict, so nothing about the lane's work was proven — the failure
+                # streak must not move (DISPATCHED -> blocked is a legal pair, and the breaker never
+                # sees this attempt at all).
+                outcomes = lane.setdefault("over_budget", [])
+                self._move(lane, "over_budget", apply(lane["status"], "block"))
+                outcomes.append({"dispatch_id": dispatch_id, "reason": reason,
+                                 "evidence": dict(evidence) if evidence else {},
+                                 "at": time.time()})
+                lane["blocked_reason"] = (
+                    f"over_budget: {reason} ({len(outcomes)} over-budget outcome(s); the acceptance "
+                    f"command exceeded the lane's recorded test_timeout_s, so no test verdict was "
+                    f"reached — the failure streak is untouched at "
+                    f"{lane['consecutive_failures']}, and this park is for review)"
+                )
+                self._write()
+                return {"accepted": True, "status": lane["status"],
+                        "consecutive_failures": lane["consecutive_failures"],
+                        "over_budget_count": len(outcomes)}
 
             if infra:
                 infra_outcomes = lane.setdefault("infra", [])

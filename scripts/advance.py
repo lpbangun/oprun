@@ -32,11 +32,19 @@ Three rules are load-bearing:
    passes. A lane that fails is *parked*, not retried blindly: the ledger's circuit breaker owns
    the failure streak, and a ``blocked`` lane is terminal as far as this process is concerned.
 5. **The environment failing is not the lane failing.** When the acceptance re-run cannot be
-   *started* (the program is not on PATH: ENOENT) or the controller's own budget kills it, no test
-   was proven red. That outcome is recorded as ``infra``, the lane goes back to ``ready`` and its
-   failure streak is left untouched — an ENOENT must never park a lane or strike the breaker
-   (issue #1). The ledger caps how many infra outcomes a lane may accumulate, so a permanently
-   unresolvable command still reaches a human.
+   *started* (the program is not on PATH: ENOENT), or a lane that recorded no acceptance budget of
+   its own is killed by the controller's default clock, no test was proven red. That outcome is
+   recorded as ``infra``, the lane goes back to ``ready`` and its failure streak is left untouched —
+   an ENOENT must never park a lane or strike the breaker (issue #1). The ledger caps how many infra
+   outcomes a lane may accumulate, so a permanently unresolvable command still reaches a human.
+6. **Four clocks, never one.** The lane's **acceptance budget** (``test_timeout_s``, recorded at
+   dispatch and read here) is how long the lane's ``test_cmd`` may run; ``--timeout`` is only the
+   **staleness** clock for a lane that has produced no artifact yet; systemd answers **process
+   lifetime**; and a human owns **parking**. A run that outgrows the lane's own recorded budget is
+   ``over_budget``: it parks for review — never ``infra`` (nothing in the environment failed, so it
+   spends no infra retry) and never a red test (nothing was proven, so it touches no failure streak).
+   This runner owns no ceiling of its own any more, and its deadline never shrinks a command that has
+   already started.
 
 No model is involved anywhere here: no LLM imports, no harness subprocess. The only subprocesses
 are the lane's own ``test_cmd`` and read-only ``systemctl``/``git`` queries.
@@ -92,17 +100,32 @@ SIDECAR_DIRNAME = ".oprun"
 SIDECAR_PREFIX = "result."
 SIDECAR_SUFFIX = ".json"
 
-#: Ceiling for one controller test re-run. Also capped by the remaining run budget, so the whole
-#: ``advance`` call stays inside its timeout even if a lane's tests hang.
-TEST_TIMEOUT = 300.0
+#: The shipped default acceptance budget, in seconds: what a lane that RECORDED no
+#: ``test_timeout_s`` of its own reads. There is deliberately no runner-owned ceiling constant any
+#: more — the old ``TEST_TIMEOUT = 300.0`` is gone, the budget comes from the lane's own record, and
+#: nothing may shrink it: not this runner's ``--timeout``/deadline (staleness is a different clock),
+#: not the loop's remaining time.
+#:
+#: ``advance`` must run with or without ``probe.py``, so the number is spelled here too — and the
+#: suite pins it equal to ``probe``'s and ``oprun``'s, so three copies cannot drift into three
+#: different 900s.
+DEFAULT_TEST_TIMEOUT_S = 900.0
+
+#: The lane field carrying the lane's acceptance budget. Spelled identically in ``probe.py`` and
+#: ``oprun.py`` and pinned to one string by the suite, exactly like :data:`UNIT_PATH_FIELD`.
+TEST_TIMEOUT_FIELD = "test_timeout_s"
+
 #: Characters of test output kept as evidence (the tail is where failures are named).
 TEST_TAIL = 2000
 
 #: Verdicts a lane can carry, matching ``probe``'s vocabulary. ``INFRA`` is the environment's
-#: failure, not the lane's: the acceptance command could not be RUN (ENOENT/timeout), so no test
-#: was proven red and nothing about it may count as a lane failure (issue #1).
-DONE, PENDING, NEEDS_INPUT, STALLED, FAILED_VERDICT, INFRA = (
-    "done", "pending", "needs_input", "stalled", "failed", "infra",
+#: failure, not the lane's: the acceptance command could not be RUN (ENOENT), so no test was proven
+#: red and nothing about it may count as a lane failure (issue #1). ``OVER_BUDGET`` is the other clock
+#: — the lane recorded an acceptance budget of its own and its command outran it: also "no verdict was
+#: reached", but the clock belongs to the lane's contract, so it parks for review instead of being
+#: retried as an environment fault.
+DONE, PENDING, NEEDS_INPUT, STALLED, FAILED_VERDICT, INFRA, OVER_BUDGET = (
+    "done", "pending", "needs_input", "stalled", "failed", "infra", "over_budget",
 )
 
 #: Acceptance re-runs the runner retries **in place** when the command could not be run at all.
@@ -143,6 +166,44 @@ def _test_cmd_env(unit_path: str | None) -> dict[str, str] | None:
     if not recorded:
         return None
     return {**os.environ, PATH_ENV: recorded}
+
+
+def recorded_test_timeout_s(lane: dict) -> float | None:
+    """The acceptance budget the lane **declared at dispatch**, or ``None`` when it declared none.
+
+    Read from the lane dict handed to this runner — never sniffed from the environment, never
+    recomputed, never defaulted here (:func:`acceptance_budget_s` is the defaulted read). Only a
+    positive finite number counts as a declaration; a missing field, ``None``, ``0``, a negative
+    value or a non-numeric string all mean "this lane declared no budget", which is what a ledger
+    written before the field existed looks like.
+
+    Twin of ``probe.recorded_test_timeout_s`` — ``advance`` must run with or without ``probe.py``,
+    so the rule lives in both and each reads the same lane field.
+    """
+    raw = lane.get(TEST_TIMEOUT_FIELD) if isinstance(lane, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if (value > 0 and value != float("inf")) else None
+
+
+def acceptance_budget_s(lane: dict) -> float:
+    """The budget this lane's acceptance re-run gets, in seconds.
+
+    A lane that declared a budget of its own is judged against THAT budget (exceeding it is
+    ``over_budget``: the clock that ran out is the lane's own contract). A lane that declared none
+    reads the shipped default, and the kill then belongs to the controller's own clock — ``infra``,
+    exactly the behaviour such a ledger had before the field existed.
+
+    Twin of ``probe.acceptance_budget_s``, for the same reason as above.
+    """
+    recorded = recorded_test_timeout_s(lane)
+    if recorded is not None:
+        return recorded
+    return float(DEFAULT_TEST_TIMEOUT_S)
 
 
 class _Decision(NamedTuple):
@@ -381,14 +442,25 @@ def _unit_lifetime(lane_id: str) -> str:
 # --- controller evidence -----------------------------------------------------
 
 
-def _run_test(lane: dict, worktree: Path, deadline: float) -> tuple[int, str, str, str]:
-    """Re-run the lane's OWN ``test_cmd`` in its worktree.
+def _run_test(lane: dict, worktree: Path) -> tuple[int, str, str, str]:
+    """Re-run the lane's OWN ``test_cmd`` in its worktree: ``(exit_code, tail, note, outcome)``.
 
-    Returns ``(exit_code, tail, note, infra_reason)``. ``infra_reason`` is non-empty **only** when
-    the command never reached a verdict of its own — the controller could not start it
-    (ENOENT/OSError/ValueError) or its own budget ran out. That is an environment fault, so the
-    caller must never count it as a failing test (issue #1: rc 127 was settled as a lane failure and
-    struck the circuit breaker).
+    ``outcome`` is ``""`` when the command reached a verdict of its own, else it names the clock
+    that killed the run — and the caller must branch on it, never flatten the two:
+
+    * ``INFRA`` — the command could not be STARTED (ENOENT/OSError/ValueError), or this lane
+      declared no acceptance budget of its own and the controller's default clock killed it. That is
+      an environment fault, so no test was proven red and the caller must never count it as a
+      failing test (issue #1: rc 127 was settled as a lane failure and struck the circuit breaker).
+    * ``OVER_BUDGET`` — the lane RECORDED an acceptance budget at dispatch (``test_timeout_s``) and
+      its own command outran it. Also "no verdict was reached", but the clock belongs to the lane's
+      own contract rather than to the environment: it parks for a human, gets no infra retry, and
+      touches no failure streak.
+
+    The budget is the lane's recorded one (:func:`acceptance_budget_s`) and NOTHING here may shrink
+    it: neither this runner's ``--timeout``/deadline nor the loop's remaining time. A command that
+    has already started runs to its own budget — shortening it would turn a slow suite into a fake
+    environment fault.
 
     The command and the working directory come from the ledger, never from the worker: a lane
     can neither choose nor skip the test that decides its own acceptance. The **environment** is
@@ -398,17 +470,18 @@ def _run_test(lane: dict, worktree: Path, deadline: float) -> tuple[int, str, st
     cmd = [str(part) for part in (lane.get("test_cmd") or [])]
     if not cmd:
         return 1, "", "lane has no test_cmd, so nothing can be re-run to accept it", ""
-    budget = min(TEST_TIMEOUT, max(1.0, deadline - time.monotonic()))
+    budget = acceptance_budget_s(lane)
+    declared = recorded_test_timeout_s(lane) is not None
     try:
         proc = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
                               timeout=budget,
                               env=_test_cmd_env(lane.get(UNIT_PATH_FIELD)))
     except subprocess.TimeoutExpired:
-        why = f"test command exceeded {budget:.0f}s"
-        return 124, "", why, why
+        why = f"test command exceeded this lane's acceptance budget of {budget:g}s"
+        return 124, "", why, (OVER_BUDGET if declared else INFRA)
     except OSError as exc:
         why = f"test command could not run: {exc}"
-        return 127, "", why, why
+        return 127, "", why, INFRA
     tail = ((proc.stdout or "") + (proc.stderr or ""))[-TEST_TAIL:]
     return proc.returncode, tail, f"exited {proc.returncode}", ""
 
@@ -466,6 +539,59 @@ def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, rea
     suffix = f" exit={exit_code}" if exit_code is not None else ""
     emit(f"[{lane_id}] NEEDS_REVIEW{suffix} {reason}")
     return _Decision(lane_id, "parked", category, reason)
+
+
+def _settle_over_budget(led: Ledger, lane_id: str, dispatch_id: str, reason: str,
+                        emit: Callable[[str], None], *, verdict: dict | None = None,
+                        witness: dict | None = None, exit_code: int | None = None,
+                        tail: str = "", budget_s: float | None = None) -> _Decision:
+    """Park a lane whose acceptance command outran the budget the lane itself RECORDED.
+
+    ``over_budget`` is a clock of its own, deliberately not folded into either of its neighbours:
+
+    * not ``infra`` — nothing in the environment failed; the command started and simply had a budget
+      too small for it, so it must not be retried in place as a transient fault;
+    * not a failure — no test was proven red, so the lane must not be counted against the circuit
+      breaker. ``consecutive_failures`` is left exactly as it was, the ledger records the outcome in
+      ``lane["over_budget"]`` and parks the lane ``blocked``, and the park itself is the escalation:
+      the lane declared a budget that has already proved too small, and re-running the same command
+      unchanged would blow it again.
+
+    The lane therefore reaches a human through the ledger's existing parked path, with the reason
+    naming ``over_budget`` and the budget.
+    """
+    lane = led.lane(lane_id)
+    evidence = {
+        "controller": "advance",
+        "dispatch_id": dispatch_id,
+        "verdict": OVER_BUDGET,
+        "outcome": OVER_BUDGET,
+        "rejected_because": reason,
+        "sidecar": (verdict or {}).get("evidence", {}).get("sidecar"),
+        "test_exit_code": exit_code,
+        "test_output_tail": tail,
+        "acceptance_budget_s": budget_s,
+        "harness": lane.get("harness"),
+        "model_requested": lane.get("model_requested"),
+        "witness": witness,
+        "checked_at": _utc_now(),
+        "note": ("the acceptance command exceeded the acceptance budget this lane recorded at "
+                 "dispatch, so it never reached a verdict of its own: this is not an environment "
+                 "fault (no infra retry) and not a red test (the failure streak is untouched) — it "
+                 "parks for review"),
+    }
+    result = led.settle(lane_id, dispatch_id, False, evidence=evidence, reason=reason,
+                        over_budget=True)
+    if not result.get("accepted"):
+        emit(f"[{lane_id}] SETTLE_REFUSED {result.get('reason')}")
+        return _Decision(lane_id, "parked", "over_budget",
+                         f"ledger refused the settlement: {result.get('reason')}")
+    count = result.get("over_budget_count")
+    suffix = f" exit={exit_code}" if exit_code is not None else ""
+    emit(f"[{lane_id}] NEEDS_REVIEW over_budget{suffix} {reason} "
+         f"(over-budget outcome {count}; the failure streak is untouched and no infra retry is "
+         f"spent — the lane is parked for review)")
+    return _Decision(lane_id, "parked", "over_budget", reason)
 
 
 def _settle_no_evidence(led: Ledger, lane_id: str, dispatch_id: str, *, lifetime: str,
@@ -575,10 +701,18 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
                             verdict=verdict, witness=witness)
 
     # Evidence is complete. The controller now re-runs the lane's OWN test command: the sidecar
-    # says the worker believes it succeeded, this says it actually did.
-    exit_code, tail, note, infra_reason = _run_test(lane, worktree, deadline)
+    # says the worker believes it succeeded, this says it actually did. The run gets the acceptance
+    # budget the LANE recorded at dispatch, and this runner's deadline is not allowed to shrink it:
+    # a command that has already started runs to its own budget (staleness is a different clock).
+    exit_code, tail, note, outcome = _run_test(lane, worktree)
+    if outcome == OVER_BUDGET:
+        # The lane's own recorded budget ran out. Not the environment's fault and not a red test, so
+        # it gets no infra retry and no breaker strike: it parks, naming what actually happened.
+        return _settle_over_budget(led, lane_id, dispatch_id, note, emit, verdict=verdict,
+                                   witness=witness, exit_code=exit_code, tail=tail,
+                                   budget_s=acceptance_budget_s(lane))
     retries = 0
-    while infra_reason and retries < INFRA_RUN_RETRIES and time.monotonic() < deadline:
+    while outcome == INFRA and retries < INFRA_RUN_RETRIES and time.monotonic() < deadline:
         # The command never ran at all. That is the environment's fault, not the lane's tests, so it
         # is retried in place a BOUNDED number of times before it is recorded as ``infra`` rather
         # than settled as a failure (issue #1). A permanent fault (a program that is not installed)
@@ -586,10 +720,10 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         # many infra outcomes a lane may accumulate.
         retries += 1
         time.sleep(min(INFRA_RETRY_BACKOFF, max(0.0, deadline - time.monotonic())))
-        emit(f"[{lane_id}] INFRA_RETRY attempt={retries}/{INFRA_RUN_RETRIES} {infra_reason}")
-        exit_code, tail, note, infra_reason = _run_test(lane, worktree, deadline)
-    if infra_reason:
-        return _settle_infra(led, lane_id, dispatch_id, infra_reason, emit, verdict=verdict,
+        emit(f"[{lane_id}] INFRA_RETRY attempt={retries}/{INFRA_RUN_RETRIES} {note}")
+        exit_code, tail, note, outcome = _run_test(lane, worktree)
+    if outcome == INFRA:
+        return _settle_infra(led, lane_id, dispatch_id, note, emit, verdict=verdict,
                              witness=witness, exit_code=exit_code, tail=tail, retries=retries)
     if exit_code != 0:
         return _settle_park(led, lane_id, dispatch_id, "test_failure",
@@ -679,6 +813,11 @@ def advance(ledger_path: Path | str, *, timeout: int = 600, poll: float = 2.0,
     gate, which is what relaunches its worker) with ``consecutive_failures`` untouched. After
     ``Ledger.infra_limit`` infra outcomes the ledger parks the lane ``blocked``, naming the
     environment in ``blocked_reason``, so a permanently unrunnable command still reaches a human.
+
+    A lane whose acceptance command outruns the budget it recorded at dispatch is the other
+    non-failure outcome, and it takes no retry at all: it is settled ``over_budget``, which parks the
+    lane ``blocked`` (``needs_review``) with the streak untouched and no infra attempt spent — the
+    budget is what has to change, and re-running the same command unchanged would blow it again.
     """
     path = Path(ledger_path)
     led = Ledger(path)
