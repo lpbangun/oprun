@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  tests:
+    name: tests (python 3.11 — the conductor's box)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python3 -m pip install --upgrade pip pytest
+      - name: Full suite
+        run: python3 -m pytest tests/ -q
+
+  skill-bundle:
+    name: skill bundle (drift gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Shell syntax
+        run: bash -n scripts/install-skill.sh
+
+      - name: SKILL.md references resolve inside the bundle
+        run: python3 scripts/check-skill-references.py
+
+      # A Hermes profile install is a snapshot and drifts. CI cannot see the live install, so it
+      # checks the two things that ARE checkable here: the installer must be complete and
+      # idempotent, and its drift detector must actually be able to fail — an always-green checker
+      # is worse than no checker, because it licenses the very drift it claims to prevent.
+      - name: Installer round trip, and the detector must be able to fail
+        run: |
+          set -euo pipefail
+          DEST="$(mktemp -d)/oprun-skill"
+
+          echo "--- fresh install, then clean"
+          scripts/install-skill.sh --dest "$DEST"
+          scripts/install-skill.sh --check --dest "$DEST"
+
+          echo "--- a modified file must be reported (exit 2)"
+          printf '\n# deliberate drift\n' >> "$DEST/scripts/probe.py"
+          set +e
+          scripts/install-skill.sh --check --dest "$DEST"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "::error::--check exited $rc with a modified file; expected 2 (the detector is blind)"
+            exit 1
+          fi
+
+          echo "--- repair, then clean again"
+          scripts/install-skill.sh --dest "$DEST"
+          scripts/install-skill.sh --check --dest "$DEST"
+
+          echo "--- a removed file must be reported too (exit 2)"
+          rm "$DEST/CHANGELOG.md"
+          set +e
+          scripts/install-skill.sh --check --dest "$DEST"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 2 ]; then
+            echo "::error::--check exited $rc with a missing file; expected 2"
+            exit 1
+          fi
+
+      - name: Critical artifacts reach an install
+        run: |
+          set -euo pipefail
+          DEST="$(mktemp -d)/oprun-skill"
+          scripts/install-skill.sh --dest "$DEST" >/dev/null
+          missing=0
+          for f in SKILL.md CHANGELOG.md scripts/oprun.py scripts/probe.py scripts/advance.py \
+                   scripts/install-skill.sh scripts/check-skill-references.py \
+                   references/routing.md references/hosting.md \
+                   templates/run-proposal.md templates/worker-brief.md; do
+            if [ ! -f "$DEST/$f" ]; then echo "::error::$f is missing from an install"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "installed $(find "$DEST" -type f | wc -l) artifacts"

@@ -1,7 +1,7 @@
 ---
 name: oprun
 description: Use when a long-horizon software mission runs via oprun.
-version: 0.2.4
+version: 0.2.5
 author: Logani Bangun (lpbangun), Hermes Agent
 license: MIT
 platforms: [linux]
