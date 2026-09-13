@@ -1,7 +1,7 @@
 ---
 name: oprun
 description: Use when a long-horizon software mission runs via oprun.
-version: 0.2.3
+version: 0.2.4
 author: Logani Bangun (lpbangun), Hermes Agent
 license: MIT
 platforms: [linux]
@@ -222,6 +222,30 @@ untouched, no `infra` retry spent).
   clock (how long a lane may produce no artifact) and never shrinks a command that has already
   started. A command that outruns the lane's recorded budget is `over_budget`: it parks for review,
   spends no `infra` retry and touches no failure streak. Fix the budget, not the verdict.
+- **Expecting `advance` to integrate.** It settles the *ledger* on evidence and performs no git side
+  effects — commit/push/merge live in the CLI's `settle --accept`. An advance-accepted lane therefore
+  carries `commit=null, uncommitted=true, hashes=<non-empty>` until someone settles it.
+- **Reading `journalctl -u <unit>` as if the unit name were per-run.** It is not: reuse a name like
+  `oprun-bench-advance` and the journal accumulates every earlier run. Filter by the ledger path in
+  the `Started …` line, and remember `--wait --pipe` routes the runner's payload to the caller, so
+  the ACCEPTED/NEEDS_REVIEW lines live in your captured stdout, not the journal.
+- **Waiting for a long lane from a background terminal call.** The agent harness wraps a background
+  command in a wall clock (`timeout N`), so a long `probe --wait` started that way is SIGTERM'd
+  (rc 143) and takes no verdict. Poll in bounded foreground calls, or run the waiter detached:
+  `systemd-run --user --unit <name> --collect -- …`. A long external reviewer belongs in a unit too,
+  never in `&`.
+- **Keeping a mission's evidence in `/tmp`.** On this host `/tmp` is wiped at **every boot**
+  (`systemd-tmpfiles` carries `D /tmp`), which destroys recorded evidence mid-mission — one reboot
+  cost a whole benchmark bundle. Keep scratch and evidence under `$HOME` (e.g. `~/oprun-evidence/`),
+  and treat a brief's `$SCRATCH/bench` as a path to relocate, not a destination.
+- **Assuming the installed skill is the repo.** A Hermes profile install
+  (`<profile>/skills/autonomous-ai-agents/oprun/`) is a *snapshot*: its `SKILL.md`, `scripts/` and
+  `templates/` drift from the repo as the product moves, and a stale install is worse than a stale
+  doc — How-to-Run points at `<this-skill>/scripts/oprun.py`, so the conductor runs the **old
+  semantics** (a 300s advance ceiling, no `over_budget`, no collision refusal) while the repo has the
+  fix. Re-sync with `scripts/install-skill.sh` (see `--check`) after any change to the completion
+  path, and confirm every path the text references actually exists — `templates/run-proposal.md` was
+  referenced for a while but absent from the install.
 
 ## Verification
 
