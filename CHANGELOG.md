@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.4 — the install can be refreshed
+
+**The bug:** a Hermes profile install is a *snapshot*, and it had drifted from this repo in both
+directions — the install carried five conductor pitfalls the repo lacked, while the repo carried the
+wake-up section and the `over_budget` / `--test-timeout` semantics the install lacked, and the
+install's `scripts/` were pre-ruling. Because `SKILL.md`'s How-to-Run points at
+`<this-skill>/scripts/oprun.py`, a stale install runs the **old completion path** (a 300s advance
+ceiling, no `over_budget`, no collision refusal) against a repo that already has the fix.
+
+- **`SKILL.md` — the five pitfalls, upstreamed.** `advance` does not integrate, so an accepted lane
+  carries `commit=null` until someone settles it; a reused unit name makes `journalctl -u` a
+  multi-run log; a background terminal call is wall-clock wrapped, so a long `probe --wait` dies
+  rc 143 with no verdict; `/tmp` is wiped at every boot, so evidence must live under `$HOME`; and
+  *assuming the installed skill is the repo*, with the re-sync checklist.
+- **`scripts/install-skill.sh` — refresh the snapshot, or fail on drift.** Syncs `SKILL.md`,
+  `CHANGELOG.md`, `scripts/`, `references/` and `templates/` into a profile install (`--profile`) or
+  any `--dest`; `--check` writes nothing and exits 2 when anything differs, so CI can catch an
+  install that would otherwise run stale semantics. The file set is globbed rather than hard-coded,
+  so a newly added module is installed instead of silently missing.
+
 ## v0.2.3 — wake-up discipline and the run proposal
 
 **The bug:** a lane runs under `systemd-run --user`, outside every channel the conductor listens on,
