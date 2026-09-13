@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.5 — the drift gate
+
+**The bug:** this repo had no CI at all, so the failure class that bit twice — a Hermes profile
+install drifting from the repo, and `SKILL.md` pointing at a file the bundle does not ship — was
+only ever caught by hand, after the fact. A checker nobody runs is a checker that does not exist.
+
+- **`.github/workflows/ci.yml` — tests plus a skill-bundle gate.** The `tests` job runs the suite on
+  3.11 (the conductor's box). The `skill-bundle` job runs `bash -n`, the reference audit, and an
+  installer round trip that asserts the drift detector can *actually fail* — exit 2 for a modified
+  file **and** for a removed file. An always-green checker is worse than none: it licenses the very
+  drift it claims to prevent. A final step asserts the critical artifacts reach an install.
+- **`scripts/check-skill-references.py` — every bundle path `SKILL.md` references must exist.** It
+  catches the "the doc tells you to run something the bundle does not ship" class
+  (`templates/run-proposal.md` was referenced while absent). Paths the doc *bans* are named in
+  `INTENTIONALLY_ABSENT` with a reason, rather than being silenced by a pattern in the checker — a
+  silencing heuristic is how a checker stops telling the truth. Prefixed references only: a bare
+  filename that resolves to a bundle file by definition exists, so checking those can never fail.
+
 ## v0.2.4 — the install can be refreshed
 
 **The bug:** a Hermes profile install is a *snapshot*, and it had drifted from this repo in both
