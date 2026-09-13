@@ -85,7 +85,8 @@ LEDGER="$REPO/.tmp/oprun/state.json"
 
 $CLI init "$REPO" --mission "…" --approve commit,push,merge     # no launch
 $CLI dispatch <lane> --harness <id> [--model PIN] \
-      --worktree "$WT/<lane>" --test-cmd "CMD" --prompt "…" [--depends-on other]
+      --worktree "$WT/<lane>" --test-cmd "CMD" --prompt "…" [--depends-on other] \
+      [--test-timeout SEC]                                      # a lane's acceptance budget
 $CLI probe <lane> [--wait --timeout 900]                        # one word; --json for detail
 $CLI settle <lane> --accept | --needs-review "…"
 $CLI status [--json]                                            # lanes + nextAction + envelope
@@ -135,9 +136,9 @@ cadence.**
 1. **Probe after every other conductor step.** After `init`, after each `dispatch`, after each
    `settle`, after any user turn inside the run, and before you answer the user, run `probe <lane>`
    for every lane the ledger holds. The verdict is one deterministic word
-   (`done|infra|pending|needs_input|stalled|failed`) — cheap enough to spend, and the only thing that
-   speaks for a lane. `status`, `systemctl` and pane text are context, never the verdict. Probing an
-   already-`done` lane is free, so cost is never a reason not to look.
+   (`done|infra|over_budget|pending|needs_input|stalled|failed`) — cheap enough to spend, and the
+   only thing that speaks for a lane. `status`, `systemctl` and pane text are context, never the
+   verdict. Probing an already-`done` lane is free, so cost is never a reason not to look.
 2. **Wait bounded, never open.** `probe <lane> --wait --timeout 900` polls until the verdict is no
    longer `pending`, then returns; `--timeout` is the budget, and `pending` at the deadline means
    *not yet*, not *never*. Loop it in bounded turns instead of holding a turn open. `sleep 600;
@@ -170,6 +171,14 @@ settled as a failure or charged to the circuit breaker.
   `INFRA_RETRY` up to the ledger's `infra_limit`. A **genuine** red test still parks immediately: a
   non-zero rc with no `infra_reason` is the lane failing, and that never gets a free retry.
 
+**over_budget: escalate, do not re-probe forever.** An `over_budget` verdict means the acceptance
+command ran past the *acceptance budget the lane recorded at dispatch* (`--test-timeout`, default
+900s). Nothing was proven red and nothing in the environment failed, so it is neither a red test nor
+an `infra` — and re-probing the same lane changes nothing. Two moves, both honest: re-dispatch with a
+budget the lane can actually meet (`dispatch --test-timeout SEC`), or park it for review with the
+reason. `advance` parks it by itself (`blocked`, reason naming `over_budget`, failure streak
+untouched, no `infra` retry spent).
+
 ## Pitfalls
 
 - **`status`/pane text is not a verdict.** Only `probe` is. A worker saying "done" is a claim.
@@ -201,6 +210,18 @@ settled as a failure or charged to the circuit breaker.
   parking. A genuine red test (non-zero rc, no `infra_reason`) still parks immediately.
 - **`git add -A` on a lane's worktree.** `.oprun/` sidecars and `__pycache__/` are lane evidence, not
   product. Stage explicit paths when integrating a lane's work, or the sidecar dir ships.
+- **A lane whose unit is already running.** `dispatch` refuses (non-zero) when `oprun-<lane>` is
+  already active, and prints the one command that frees the name:
+  `systemctl --user stop oprun-<lane>`. It never stops a live worker itself and never settles the
+  lane as a failure just because the name is occupied — the running worker may still be about to
+  write evidence a human wants — and the lane is left ready to be dispatched. There is deliberately
+  no `oprun stop` / `oprun reap` verb: native systemd is the smallest correct escape.
+- **One timeout clock for everything.** A lane's *acceptance budget* (`dispatch --test-timeout`,
+  default 900s, recorded on the lane and read by every acceptance re-run) is how long the
+  controller's re-run of `--test-cmd` may take; `probe`/`advance --timeout` is only the *staleness*
+  clock (how long a lane may produce no artifact) and never shrinks a command that has already
+  started. A command that outruns the lane's recorded budget is `over_budget`: it parks for review,
+  spends no `infra` retry and touches no failure streak. Fix the budget, not the verdict.
 
 ## Verification
 

@@ -99,15 +99,31 @@ def run_probe(lane: dict, *, unit_active: bool = False, timeout_exceeded: bool =
 
 # --- vocabulary --------------------------------------------------------------
 def test_verdict_vocabulary_is_frozen() -> None:
-    """The vocabulary is closed: exactly these words, and ``infra`` is the one issue #1 added.
+    """The vocabulary is closed: exactly these words, ``infra`` and ``over_budget`` included.
 
     ``infra`` is not a lane outcome at all — it says the controller could not RUN the lane's
-    acceptance command (ENOENT, not executable, or its own budget ran out), so no test was proven
-    either way. It is kept apart from ``failed``/``needs_input`` because an environment fault must
-    never be read as a red test.
+    acceptance command (ENOENT, not executable, or the controller's own clock on a lane that
+    declared no budget), so no test was proven either way.
+
+    ``over_budget`` is the other clock, and it is kept apart from ``infra`` for exactly the same
+    reason: the lane RECORDED an acceptance budget at dispatch (``test_timeout_s``) and its own
+    command outran it. Also "no verdict was reached", but the clock belongs to the lane's contract,
+    so it parks for review instead of being read as an environment fault (``infra``), a red test
+    (``failed``) or a decision for a human on evidence (``needs_input``).
+
+    The property this test exists for — every verdict ``probe`` can return is in this tuple — is
+    asserted twice: by the exact equality below, and by reading the shipped source so a new
+    ``verdict("…")`` call cannot outrun the vocabulary.
     """
-    assert probe.VERDICTS == ("done", "infra", "pending", "needs_input", "stalled", "failed")
+    assert probe.VERDICTS == (
+        "done", "infra", "over_budget", "pending", "needs_input", "stalled", "failed",
+    )
     assert len(set(probe.VERDICTS)) == len(probe.VERDICTS), "one word per verdict, no aliases"
+
+    source = Path(probe.__file__).read_text(encoding="utf-8")
+    returned = {chunk.split('"', 1)[0] for chunk in source.split('verdict("')[1:]}
+    assert returned <= set(probe.VERDICTS), f"returned but not declared: {returned - set(probe.VERDICTS)}"
+    assert "over_budget" in returned, "the new verdict must actually be reachable from probe()"
 
 
 def test_every_verdict_returned_is_in_the_vocabulary(tmp_path: Path) -> None:

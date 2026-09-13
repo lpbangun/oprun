@@ -14,10 +14,18 @@ already true, in this order:
    path the sidecar names.
 
 ``done`` requires all three to agree. Anything less is ``infra`` (the controller could not RUN the
-lane's own ``test_cmd`` — ENOENT, not executable, or its own budget ran out: an environment fault,
-never a red test, and never counted as a lane failure), ``needs_input`` (a human decides),
-``stalled`` (the timeout passed with no acceptable artifact), ``pending`` (the unit is still
-running and there is no artifact yet), or ``failed`` (the ledger parked the lane).
+lane's own ``test_cmd`` — ENOENT, not executable, or the controller's own clock ran out on a lane
+that declared no budget: an environment fault, never a red test, and never counted as a lane
+failure), ``over_budget`` (the lane RECORDED an acceptance budget at dispatch and its own command
+exceeded it — no verdict was reached, so it parks for a human and touches no failure streak),
+``needs_input`` (a human decides), ``stalled`` (the timeout passed with no acceptable artifact),
+``pending`` (the unit is still running and there is no artifact yet), or ``failed`` (the ledger
+parked the lane).
+
+Four clocks, never one: the lane's **acceptance budget** (``test_timeout_s``, recorded at dispatch),
+**staleness** (``--timeout``: how long a lane may produce no artifact), **process lifetime**
+(systemd) and **human parking**. Collapsing them turns a slow suite into a fake environment fault
+and kills valid workers.
 
 Boundaries, deliberately: no model, no network, and no subprocess except ``systemctl --user
 is-active`` (process **lifetime**) and the lane's own ``test_cmd`` (the acceptance re-run). systemd
@@ -39,11 +47,18 @@ from typing import Any, Callable, Iterator
 from ledger import BLOCKED, DISPATCHED, FAILED, Ledger
 
 #: The complete verdict vocabulary. Every return value of :func:`probe` is one of these.
-#: ``infra`` is the sixth: the controller could not RUN the lane's acceptance command (the program
-#: is not on PATH, or the run blew the controller's own budget). That is the *environment* failing,
-#: never a red test — conflating the two is issue #1, where an ENOENT inside a systemd unit came
-#: back as rc 127 and was settled as a lane failure with a circuit-breaker strike attached.
-VERDICTS = ("done", "infra", "pending", "needs_input", "stalled", "failed")
+#:
+#: ``infra`` is the environment failing, never a red test: the controller could not RUN the lane's
+#: acceptance command at all — the program is not on PATH, or a lane that declared no budget of its
+#: own blew the controller's default clock. Conflating the two is issue #1, where an ENOENT inside a
+#: systemd unit came back as rc 127 and was settled as a lane failure with a circuit-breaker strike
+#: attached.
+#:
+#: ``over_budget`` is a *different* clock on purpose: the lane declared its own acceptance budget
+#: (``test_timeout_s``, written at dispatch) and its command exceeded it. No test was proven red
+#: either, so it is neither ``infra`` (nothing in the environment failed) nor a failure: it parks
+#: through the human-review path, touches no failure streak and gets no infra retry.
+VERDICTS = ("done", "infra", "over_budget", "pending", "needs_input", "stalled", "failed")
 
 #: Registry ids, matching ``harnesses.py``. Every shipped harness must be mapped below: an
 #: unmapped harness that reached :func:`probe` would be silently treated as success.
@@ -55,8 +70,22 @@ PARKED_STATUSES = frozenset({FAILED, BLOCKED})
 #: Sidecar filename, relative to the lane's ``.oprun`` directory.
 SIDECAR_TEMPLATE = "result.{dispatch_id}.json"
 
-#: Seconds the acceptance re-run of a lane's own ``test_cmd`` may take (``timeout(1)`` rc 124).
-TEST_CMD_TIMEOUT_SECONDS = 900
+#: The controller's own clock on a single acceptance re-run (``timeout(1)`` rc 124), and the ONE
+#: place the shipped default acceptance budget is written. A lane that declared no budget of its own
+#: (a legacy ledger with no ``test_timeout_s``) is read as this number, and a run THIS clock kills is
+#: the environment fault ``infra`` — never a red test, and never ``over_budget``.
+TEST_CMD_TIMEOUT_SECONDS = 900.0
+
+#: The shipped default acceptance budget, in seconds — **derived** from the controller's clock above
+#: so the two can never drift into two different 900s. This is the number ``dispatch`` RECORDS on a
+#: lane (``--test-timeout``'s default, read by ``oprun`` and by ``advance``); a lane that recorded
+#: nothing is judged by the controller's clock above, and a kill by that clock is ``infra``.
+DEFAULT_TEST_TIMEOUT_S = TEST_CMD_TIMEOUT_SECONDS
+
+#: The lane field carrying the lane's ACCEPTANCE budget, written once at dispatch and read by every
+#: acceptance re-run site (this module, ``advance._run_test``, ``oprun.settle --accept``). Spelled
+#: identically in those modules and pinned to one string by the suite, like ``UNIT_PATH_FIELD``.
+TEST_TIMEOUT_FIELD = "test_timeout_s"
 
 #: rc the controller assigns when the lane's ``test_cmd`` could not be STARTED at all: the program
 #: is not on PATH (ENOENT), is not executable, or the arguments are malformed. The command never
@@ -352,6 +381,43 @@ def _missing_evidence_paths(sidecar: dict, root: Path, base: Path) -> list[str]:
     return missing
 
 
+def recorded_test_timeout_s(lane: dict) -> float | None:
+    """The acceptance budget the lane **declared at dispatch**, or ``None`` when it declared none.
+
+    Read from the lane dict handed in — never sniffed from the environment, never recomputed, never
+    defaulted here (see :func:`acceptance_budget_s` for the defaulted read). Only a positive finite
+    number counts as a declaration: a missing field, ``None``, ``0``, a negative value or a
+    non-numeric string all mean "this lane declared no budget", which is exactly what a ledger
+    written before the field existed looks like.
+    """
+    raw = lane.get(TEST_TIMEOUT_FIELD) if isinstance(lane, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if (value > 0 and value != float("inf")) else None
+
+
+def acceptance_budget_s(lane: dict) -> float:
+    """The budget the lane's acceptance re-run gets, in seconds.
+
+    A lane that declared a budget of its own is judged against THAT budget: exceeding it is
+    ``over_budget``, because the clock that ran out belongs to the lane's own contract. A lane that
+    declared none — every ledger written before ``test_timeout_s`` existed — reads the controller's
+    own default clock (:data:`TEST_CMD_TIMEOUT_SECONDS`, 900 seconds by default), and a kill by that
+    clock is ``infra``, exactly the behaviour such a ledger had before.
+
+    The default is read **live** off the module attribute rather than off a copy: it is the
+    controller's own clock, and whoever tightens that clock must tighten this read with it.
+    """
+    recorded = recorded_test_timeout_s(lane)
+    if recorded is not None:
+        return recorded
+    return float(TEST_CMD_TIMEOUT_SECONDS)
+
+
 def _test_cmd_env(unit_path: str | None) -> dict[str, str] | None:
     """The environment a lane's ``test_cmd`` is re-run under — ``None`` means "inherit ours".
 
@@ -376,22 +442,29 @@ def _test_cmd_env(unit_path: str | None) -> dict[str, str] | None:
 
 
 def _run_test_cmd(test_cmd: list[str], worktree: Path,
-                  unit_path: str | None = None) -> tuple[int, str, str]:
-    """The controller's OWN re-run of the lane's ``test_cmd``: ``(rc, output tail, infra_reason)``.
+                  unit_path: str | None = None, *,
+                  budget_s: float | None = None) -> tuple[int, str, str]:
+    """The controller's OWN re-run of the lane's ``test_cmd``: ``(rc, output tail, reason)``.
 
     Nothing the worker reported matters here: this is the acceptance test executing on the
     controller's side. ``unit_path`` is the PATH the lane's worker unit was launched with, when
     the ledger has one (see :func:`_test_cmd_env`); the command then runs under that PATH instead
-    of the controller's own. ``infra_reason`` is non-empty **only** when the run never produced a
-    verdict of the command's own:
+    of the controller's own. ``budget_s`` is the budget the run gets — the lane's recorded
+    ``test_timeout_s`` (see :func:`acceptance_budget_s` when the caller wants the defaulted read);
+    ``None`` falls back to the controller's own clock, :data:`TEST_CMD_TIMEOUT_SECONDS`.
+
+    ``reason`` is non-empty **only** when the run never produced a verdict of the command's own:
 
     * the command could not be started (ENOENT/OSError/ValueError) -> rc 127;
-    * the controller killed it on its own budget -> rc 124.
+    * the budget ran out -> rc 124.
 
-    A non-zero rc with an empty ``infra_reason`` is the lane's own failing test. The two are kept
-    apart on purpose (issue #1): an environment fault settled as a red test parks a lane and feeds
-    the circuit breaker for something the lane never did.
+    Which *clock* that budget was decides the caller's verdict, not this function's: a declared
+    lane budget is ``over_budget``, the controller's own default clock is ``infra``. A non-zero rc
+    with an empty ``reason`` is the lane's own failing test. The two are kept apart on purpose
+    (issue #1): an environment fault settled as a red test parks a lane and feeds the circuit
+    breaker for something the lane never did.
     """
+    budget = float(budget_s) if budget_s is not None else float(TEST_CMD_TIMEOUT_SECONDS)
     if not worktree.is_dir():
         return TEST_CMD_NOT_RUNNABLE_RC, f"worktree is not a directory: {worktree}", \
             f"worktree is not a directory: {worktree}"
@@ -401,12 +474,12 @@ def _run_test_cmd(test_cmd: list[str], worktree: Path,
             cwd=str(worktree),
             capture_output=True,
             text=True,
-            timeout=TEST_CMD_TIMEOUT_SECONDS,
+            timeout=budget,
             env=_test_cmd_env(unit_path),
         )
     except subprocess.TimeoutExpired:
-        return (TEST_CMD_TIMEOUT_RC, f"test_cmd timed out after {TEST_CMD_TIMEOUT_SECONDS}s",
-                f"test_cmd timed out after {TEST_CMD_TIMEOUT_SECONDS}s")
+        reason = f"test_cmd timed out after {budget:g}s (its acceptance budget)"
+        return TEST_CMD_TIMEOUT_RC, reason, reason
     except (OSError, ValueError) as exc:
         return TEST_CMD_NOT_RUNNABLE_RC, f"test_cmd could not be run: {exc}", \
             f"test_cmd could not be run: {exc}"
@@ -465,13 +538,19 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
     lane has no recorded PATH — so a lane's acceptance command runs where its worker ran it.
 
     ``unit_active`` (systemd lifetime) and ``timeout_exceeded`` only classify *absence* of an
-    artifact: pending while the unit runs, ``stalled`` once the timeout has passed, otherwise
-    ``needs_input``. A parked (FAILED/BLOCKED) ledger lane is ``failed``, full stop.
+    artifact: ``pending`` while the unit runs **and** the cutoff has not passed, ``stalled`` once it
+    has (whatever the unit is doing — the reason and the evidence carry the liveness the caller would
+    otherwise have to ask systemd for), otherwise ``needs_input``. A parked (FAILED/BLOCKED) ledger
+    lane is ``failed``, full stop.
 
-    The one verdict that is not about the lane at all: when the acceptance re-run cannot be
-    *started* (or the controller's own budget kills it) the verdict is ``infra`` — the command
-    never ran, so no test is proven red and the lane is not failing. A red re-run (a real non-zero
-    exit of the command itself) stays ``needs_input``, exactly as before.
+    Two verdicts are not about the lane's work at all, and they are different clocks:
+    ``infra`` when the acceptance re-run cannot be *started*, or a lane that declared no budget of
+    its own is killed by the controller's default clock — the command never ran, so no test is
+    proven red and the lane is not failing; and ``over_budget`` when the lane DID declare an
+    acceptance budget (``test_timeout_s``) and its own command outran it — also "no verdict was
+    reached", but the clock that ran out belongs to the lane's own contract, so it parks for review
+    instead of being retried as an environment fault. A red re-run (a real non-zero exit of the
+    command itself) stays ``needs_input``, exactly as before.
     """
     status = lane.get("status")
     dispatch_id = lane.get("dispatch_id")
@@ -487,6 +566,11 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
     # Recorded at dispatch on the lane's own record: the PATH its worker unit was pinned with.
     # Read from the lane dict handed in — never sniffed from the environment, never recomputed.
     unit_path = str(lane.get(UNIT_PATH_FIELD) or "").strip()
+    # The ACCEPTANCE budget, also read from the lane's own record: the re-run gets exactly what the
+    # lane declared at dispatch (`over_budget` when that runs out), and a lane that declared nothing
+    # gets the shipped default clock (the environment's `infra`). Two clocks, deliberately not one.
+    recorded_budget = recorded_test_timeout_s(lane)
+    budget = acceptance_budget_s(lane)
 
     evidence: dict[str, Any] = {
         "lane_id": lane_id,
@@ -502,6 +586,9 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
         "test_cmd": test_cmd,
         # ``None`` means "no recorded PATH": the re-run then inherits the ambient environment.
         "unit_path": unit_path or None,
+        # The budget this lane's acceptance re-run will get, and whether the lane declared it.
+        "acceptance_budget_s": budget,
+        "budget_recorded": recorded_budget is not None,
         "test_rc": None,
         "missing_evidence_paths": [],
     }
@@ -510,12 +597,28 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
         return {"verdict": name, "reason": reason, "evidence": dict(evidence)}
 
     def absent(reason: str) -> dict:
-        """Classify the absence of an acceptable artifact — never as success."""
+        """Classify the absence of an acceptable artifact — never as success.
+
+        The frozen rule (C8, wording untouched): *"Lane with no sidecar past ``--timeout``: probe in
+        ``{needs_input,stalled}``; must not remain pending; must not auto-wait forever."* So past the
+        cutoff the answer is ``stalled`` whatever the unit is doing — ``pending`` is only valid
+        *before* the cutoff, because a lane that has produced no artifact for a whole timeout is a
+        fact a conductor has to escalate even while the process is still alive. The unit's liveness is
+        not dropped: it is surfaced in the reason and in the evidence, so a reader can tell "still
+        running, probe did not wait" from "nothing is running at all". ``advance`` may separately
+        report such a lane ``timed_out`` and leave it ``dispatched`` — that is scheduler behaviour,
+        not a probe classification.
+        """
+        liveness = "unit still active" if unit_active else "unit is not active"
         if timeout_exceeded:
-            return verdict("stalled", f"{reason}; timeout exceeded with no acceptable artifact")
+            note = f"{liveness}; probe did not wait" if unit_active else liveness
+            evidence["liveness_note"] = note
+            return verdict("stalled", f"{reason}; timeout exceeded with no acceptable artifact "
+                                      f"({note})")
+        evidence["liveness_note"] = liveness
         if unit_active:
-            return verdict("pending", f"{reason}; unit still active")
-        return verdict("needs_input", f"{reason}; unit is not active and no artifact will appear")
+            return verdict("pending", f"{reason}; {liveness}")
+        return verdict("needs_input", f"{reason}; {liveness} and no artifact will appear")
 
     # 1. the ledger's own word: a parked lane is failed, and no sidecar can overrule that.
     if status in PARKED_STATUSES:
@@ -558,18 +661,29 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
                        f"sidecar reports status={sidecar.get('status')!r}, not "
                        f"{SUCCESS_STATUS!r}")
 
-    # 4. the controller re-runs the lane's OWN test command.
+    # 4. the controller re-runs the lane's OWN test command, in the lane's OWN acceptance budget.
     if not test_cmd:
         return verdict("needs_input", "lane has no test_cmd: evidence alone cannot be accepted")
-    rc, tail, infra_reason = _run_test_cmd(test_cmd, root, unit_path=unit_path)
+    rc, tail, reason = _run_test_cmd(test_cmd, root, unit_path=unit_path, budget_s=budget)
     evidence["test_rc"] = rc
     evidence["test_output_tail"] = tail
-    if infra_reason:
-        # The command never reached a verdict of its own: the environment could not run it. This is
-        # `infra`, never `failed`/`needs_input` — no test was proven red, so nothing here may be
-        # counted as a lane failure (issue #1).
-        evidence["infra_reason"] = infra_reason
-        return verdict("infra", f"controller could not run test_cmd {test_cmd!r}: {infra_reason}")
+    if rc == TEST_CMD_TIMEOUT_RC and recorded_budget is not None:
+        # The lane DECLARED this budget and its own command outran it. Nothing was proven red — the
+        # command never reached a verdict — so this is not `infra` (the environment did not fail) and
+        # not a failure: it is `over_budget`, which parks through the human-review path and leaves
+        # the failure streak untouched.
+        evidence["over_budget_reason"] = reason
+        return verdict("over_budget",
+                       f"acceptance command exceeded this lane's recorded "
+                       f"{TEST_TIMEOUT_FIELD}={budget:g}s: {reason}; park for review "
+                       f"(not infra, no failure streak, no infra retry)")
+    if reason:
+        # The command never reached a verdict of its own: the environment could not run it, or the
+        # controller's own default clock killed a lane that declared no budget. This is `infra`,
+        # never `failed`/`needs_input` — no test was proven red, so nothing here may be counted as a
+        # lane failure (issue #1).
+        evidence["infra_reason"] = reason
+        return verdict("infra", f"controller could not run test_cmd {test_cmd!r}: {reason}")
     if rc != 0:
         return verdict("needs_input",
                        f"controller re-run of test_cmd exited {rc} "

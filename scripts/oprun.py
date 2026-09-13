@@ -61,7 +61,6 @@ from ledger import (  # noqa: E402  (sibling: the only lane-status authority)
     BLOCKED,
     COMPLETED,
     DISPATCHED,
-    FAILED,
     PARKED,
     PENDING,
     DepthExceeded,
@@ -131,7 +130,13 @@ EXIT_SIDE_EFFECT = 5    # a granted git action failed
 EXIT_INTERNAL = 70      # a bug; never a traceback on stderr unless OPRUN_DEBUG is set
 
 GIT_TIMEOUT = 120.0
-TEST_TIMEOUT = 900.0
+#: The lane field carrying the lane's ACCEPTANCE budget (seconds), written at dispatch and read by
+#: every acceptance re-run site — ``probe.py``, ``advance.py`` and this module's own
+#: ``_run_test_cmd``. Spelled identically in all three and pinned to one string by the suite.
+TEST_TIMEOUT_FIELD = "test_timeout_s"
+#: The shipped default acceptance budget: one number, taken from the witness module that owns the
+#: re-run rule (:data:`probe.DEFAULT_TEST_TIMEOUT_S`) instead of being written a second time here.
+DEFAULT_TEST_TIMEOUT_S = probe_mod.DEFAULT_TEST_TIMEOUT_S
 #: Characters of a test/git output tail kept in evidence.
 TAIL_CHARS = 400
 
@@ -368,26 +373,32 @@ def _git(worktree: Path, *args: str) -> tuple[int, str, str]:
 
 
 def _run_test_cmd(test_cmd: list[str], worktree: Path,
-                  unit_path: str | None = None) -> tuple[int, str]:
+                  unit_path: str | None = None, *,
+                  budget_s: float | None = None) -> tuple[int, str]:
     """Re-run the lane's OWN ``test_cmd`` in its worktree: ``(rc, output tail)``.
 
     The command comes from the ledger, never from the worker, and this is the same acceptance
     re-run ``probe`` performs — so ``settle --accept`` cannot be talked past a red test. The
     **environment** is the lane's own recorded launch PATH when it has one (the rule lives once, in
     ``probe._test_cmd_env``), so the CLI's re-run reproduces the PATH the worker ran under instead
-    of the conductor's; with no recording the ambient environment is inherited, as before.
+    of the conductor's; with no recording the ambient environment is inherited, as before. The
+    **budget** is the lane's recorded acceptance budget when the caller passes one
+    (``probe.acceptance_budget_s``), else the shipped default: it is the lane's contract, and rc 124
+    means the command outran it — ``over_budget``, an escalation for a human, never an environment
+    fault and never a red test.
     """
     cmd = [str(part) for part in test_cmd]
+    budget = float(budget_s) if budget_s is not None else DEFAULT_TEST_TIMEOUT_S
     if not cmd:
         return 1, "lane has no test_cmd: nothing can be re-run to accept it"
     if not worktree.is_dir():
         return 127, f"worktree is not a directory: {worktree}"
     try:
         proc = subprocess.run(cmd, cwd=str(worktree), capture_output=True, text=True,
-                              timeout=TEST_TIMEOUT,
+                              timeout=budget,
                               env=probe_mod._test_cmd_env(unit_path))
     except subprocess.TimeoutExpired:
-        return 124, f"test_cmd timed out after {TEST_TIMEOUT:.0f}s"
+        return 124, f"test_cmd timed out after {budget:g}s (the lane's acceptance budget)"
     except (OSError, ValueError) as exc:
         return 127, f"test_cmd could not be run: {exc}"
     tail = ((proc.stdout or "") + (proc.stderr or "")).strip()
@@ -918,6 +929,14 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
             EXIT_REFUSED,
         )
 
+    # The dispatch-only ``--test-timeout`` override is validated here, before anything is registered
+    # or launched: a zero, negative, NaN or infinite budget is not a budget at all. The value the
+    # lane actually records is resolved below, once the ledger is in hand (flag > what the lane
+    # already recorded > the shipped default).
+    if args.test_timeout is not None:
+        if not (float(args.test_timeout) > 0) or float(args.test_timeout) == float("inf"):
+            raise CLIError("--test-timeout must be a positive, finite number of seconds", EXIT_USAGE)
+
     if args.brief and args.prompt:
         raise CLIError("--brief and --prompt are alternatives; pass one")
     if args.brief:
@@ -936,18 +955,61 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         raise CLIError(f"--worktree is not a directory: {worktree}")
 
     led = _load_ledger(ledger_path)
-    led.init_lane(
-        lane,
-        harness=harness_id,
-        worktree=str(worktree),
-        test_cmd=test_cmd,
-        model=args.model,
-        depends_on=list(args.depends_on or []),
-        depth=args.depth,
-        # Where this lane's work is meant to land, recorded **now** (at dispatch) so settle can
-        # refuse a primary worktree that is on some other branch instead of merging by luck.
-        merge_into=_branch_name(args.into, flag="--into") if args.into else None,
-    )
+    unit = launch.unit_name(lane)
+    # The acceptance budget this lane will be judged against, resolved once and recorded on the lane
+    # (``test_timeout_s``) so every acceptance re-run site READS that number instead of carrying a
+    # constant of its own, and no runner deadline may shrink it. Precedence, deliberately:
+    # the explicit ``--test-timeout`` flag, then the budget the lane ALREADY recorded (a re-dispatch
+    # that does not restate it must not silently reset it), then the shipped default for a new lane.
+    _existing = (led.data.get("lanes") or {}).get(lane) or {}
+    test_timeout_s = (float(args.test_timeout) if args.test_timeout is not None
+                      else probe_mod.acceptance_budget_s(_existing))
+
+    def _register() -> None:
+        """Register the lane (idempotent) with its whole dispatch-time contract."""
+        led.init_lane(
+            lane,
+            harness=harness_id,
+            worktree=str(worktree),
+            test_cmd=test_cmd,
+            model=args.model,
+            depends_on=list(args.depends_on or []),
+            depth=args.depth,
+            # Where this lane's work is meant to land, recorded **now** (at dispatch) so settle can
+            # refuse a primary worktree that is on some other branch instead of merging by luck.
+            merge_into=_branch_name(args.into, flag="--into") if args.into else None,
+            # The acceptance budget, recorded once, here. An explicit ``--test-timeout`` replaces a
+            # previously recorded value (a re-dispatch is the conductor re-stating the lane's
+            # contract); passing nothing never clears it, so a re-dispatch cannot silently reset it.
+            test_timeout_s=test_timeout_s,
+        )
+
+    # Unit collision, checked BEFORE the lane is moved to ``dispatched``. If a worker is already
+    # running under this lane's unit, dispatching would hand the lane a NEW token while the old
+    # worker kept writing evidence for the old one — and ``systemd-run`` would simply fail on the
+    # occupied name. So: refuse, print the ONE command that frees the name, and leave the lane ready
+    # to be dispatched. Nothing is stopped automatically (that worker may still be about to produce
+    # evidence a human wants) and nothing is settled as a failure merely because the name is
+    # occupied. ``systemctl --user stop`` is the smallest correct escape; oprun deliberately owns no
+    # stop/reap verb.
+    if launch.unit_status(unit)["active"]:
+        # A lane that does not exist yet is still registered (without a dispatch, a brief or a
+        # launch), so the refusal leaves a visible, dispatchable lane behind. An EXISTING lane is
+        # left exactly as it is: a live worker's recorded budget and merge target are not re-stated
+        # by a command that was refused.
+        if lane not in (led.data.get("lanes") or {}):
+            _register()
+        print(f"oprun dispatch: lane {lane!r} refused: unit {unit} is already active",
+              file=sys.stderr)
+        print(f"systemctl --user stop {unit}", file=sys.stderr)
+        raise CLIError(
+            f"lane {lane!r} not dispatched: unit {unit} is already active. Stop the running worker "
+            f"first with: systemctl --user stop {unit} — then dispatch again. The lane is left "
+            f"ready: nothing was launched, no dispatch token was consumed and nothing was settled.",
+            EXIT_ILLEGAL,
+        )
+
+    _register()
     dispatch_id = led.dispatch(lane)   # dependency gate / depth / cap live here
 
     brief_text = render_worker_brief(lane=lane, dispatch_id=dispatch_id, worktree=worktree,
@@ -968,13 +1030,18 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     argv = build_worker_argv(harness_id, model=args.model, brief_path=brief_path,
                              brief_text=brief_text)
     argv[0] = binary
-    unit = launch.unit_name(lane)
     result = launch.launch(unit, argv, workdir=worktree, env=None)
     if not result.get("started"):
-        led.settle(lane, dispatch_id, False, reason=f"launch failed: {result.get('detail')}",
+        detail = str(result.get("detail") or "")
+        if launch.unit_status(unit)["active"]:
+            # The name was taken between the check above and the launch: same fact, same escape —
+            # systemd's own stop command, never an oprun verb and never a silent kill.
+            detail = (f"{detail} (unit {unit} is active: stop it with "
+                      f"systemctl --user stop {unit})")
+        led.settle(lane, dispatch_id, False, reason=f"launch failed: {detail}",
                    evidence={"controller": "oprun-dispatch", "dispatch_id": dispatch_id,
                              "launch": result, "checked_at": _utc_now()})
-        raise CLIError(f"lane {lane!r} not launched: {result.get('detail')}")
+        raise CLIError(f"lane {lane!r} not launched: {detail}")
 
     # Record the PATH this unit was pinned with on the lane's own record — the value ``launch()``
     # itself reports, never a recomputed one — so the controller's acceptance re-run re-runs the
@@ -1277,8 +1344,23 @@ def cmd_settle(args: argparse.Namespace) -> int:
                                    _identity_fields(lane, worktree, str(dispatch_id), document),
                                    identity_warning=warning)
 
-    # 3. The controller's own re-run of the lane's test. Red test => no accept.
-    rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree, lane.get(UNIT_PATH_FIELD))
+    # 3. The controller's own re-run of the lane's test, inside the lane's OWN acceptance budget
+    #    (recorded at dispatch; the shipped default when the lane declared none). Red test => no
+    #    accept; a command that outran the lane's budget reached no verdict at all, so it is
+    #    `over_budget` — an escalation for a human, never an environment fault and never a failure.
+    budget = probe_mod.acceptance_budget_s(lane)
+    rc, tail = _run_test_cmd(lane.get("test_cmd") or [], worktree, lane.get(UNIT_PATH_FIELD),
+                             budget_s=budget)
+    if rc == 124:
+        judged_by = (f"its recorded {TEST_TIMEOUT_FIELD}" if probe_mod.recorded_test_timeout_s(lane)
+                     else "the acceptance budget it was judged by")
+        raise CLIError(
+            f"lane {args.lane!r} acceptance command exceeded {judged_by} ({budget:g}s): the command "
+            f"never reached a verdict, so no test is proven red and no failure is recorded; refusing "
+            f"--accept (over_budget: raise the budget at the next dispatch with --test-timeout SEC, "
+            f"or use --needs-review). output tail: {tail[-200:]!r}",
+            EXIT_ERROR,
+        )
     if rc != 0:
         raise CLIError(
             f"lane {args.lane!r} test_cmd exited {rc}; refusing --accept "
@@ -1423,15 +1505,18 @@ def cmd_settle(args: argparse.Namespace) -> int:
 
 # --- verbs: status -----------------------------------------------------------
 def _next_action(lanes: dict) -> str:
-    """The single next thing a conductor should do, or ``none`` when the mission is settled."""
+    """The single next thing a conductor should do, or ``none`` when there is nothing to act on.
+
+    A parked lane is terminal for this workflow, so it contributes NO action: ``settle`` is
+    restricted to in-flight lanes (``cmd_settle`` refuses anything that is not ``dispatched``), so
+    suggesting ``settle <lane> --needs-review`` for a lane the ledger already parked would emit a
+    command that cannot succeed — the parked reason is not a state to rewrite, it is the record.
+    """
     if not lanes:
         return "none"
     for lane_id, lane in lanes.items():
         if lane.get("status") == BLOCKED:
             return f"review {lane_id} (blocked)"
-    for lane_id, lane in lanes.items():
-        if lane.get("status") == FAILED:
-            return f"settle {lane_id} --needs-review REASON"
     for lane_id, lane in lanes.items():
         if lane.get("status") == DISPATCHED:
             return f"probe {lane_id}"
@@ -1581,6 +1666,12 @@ def build_parser() -> argparse.ArgumentParser:
                                "a primary worktree checked out elsewhere)")
     dispatch.add_argument("--depth", type=int, default=0, metavar="N",
                           help="nesting depth (0 = root; a nested lane is refused past max_depth)")
+    dispatch.add_argument("--test-timeout", type=float, default=None, metavar="SEC",
+                          help=f"the lane's acceptance budget in seconds: how long the controller's "
+                               f"re-run of --test-cmd may take (default "
+                               f"{DEFAULT_TEST_TIMEOUT_S:g}). Recorded on the lane at dispatch and "
+                               f"read by every acceptance path; separate from probe's --timeout, "
+                               f"which is only the staleness clock")
     _add_ledger_option(dispatch, suppress=True)
     dispatch.set_defaults(func=cmd_dispatch)
 
