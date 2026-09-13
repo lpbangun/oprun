@@ -48,6 +48,9 @@ fi
 # newly added module is installed instead of silently missing from the install.
 relative_files() {
   printf '%s\n' SKILL.md
+  # CHANGELOG.md is a root companion the install ships, so it drifts too — and a glob over the
+  # subdirs below would silently skip it, which is a false "in sync".
+  if [ -f "$REPO_DIR/CHANGELOG.md" ]; then printf '%s\n' CHANGELOG.md; fi
   local d
   for d in $DIRS; do
     [ -d "$REPO_DIR/$d" ] || continue
