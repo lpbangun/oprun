@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,6 +68,7 @@ def make_lane(tmp_path: Path, *, lane_id: str = "lane-a", dispatch_id: str = "la
 def write_sidecar(worktree: Path, dispatch_id: str, *, sidecar_dispatch_id: str | None = None,
                   task_id: str = "lane-a", status: str = "success",
                   files: tuple[str, ...] = (), log_path: str = "",
+                  waiver: str | None = "legacy test waiver", review_unavailable: bool = False,
                   raw: str | None = None) -> Path:
     """Write the lane's sidecar at the canonical path — the same shape the canary workers wrote."""
     base = worktree / ".oprun"
@@ -85,6 +87,8 @@ def write_sidecar(worktree: Path, dispatch_id: str, *, sidecar_dispatch_id: str 
             "commit": None,
             "files": list(files),
             "log_path": log_path,
+            "waiver": waiver if waiver is not None else "fixture has no artifact files",
+            **({"review_unavailable": True} if review_unavailable else {}),
         },
         "summary": "implemented the slice",
         "finished_at": "2026-09-11T17:24:31Z",
@@ -116,7 +120,7 @@ def test_verdict_vocabulary_is_frozen() -> None:
     ``verdict("…")`` call cannot outrun the vocabulary.
     """
     assert probe.VERDICTS == (
-        "done", "infra", "over_budget", "pending", "needs_input", "stalled", "failed",
+        "done", "infra", "over_budget", "pending", "needs_input", "stalled", "evidence_unresolved", "review_unavailable", "failed",
     )
     assert len(set(probe.VERDICTS)) == len(probe.VERDICTS), "one word per verdict, no aliases"
 
@@ -496,7 +500,7 @@ def test_missing_evidence_file_is_needs_input(tmp_path: Path) -> None:
     write_sidecar(worktree, "lane-a-d1", files=("stats.py",))
 
     result = run_probe(lane, unit_active=False)
-    assert result["verdict"] == "needs_input"
+    assert result["verdict"] == "evidence_unresolved"
     assert result["verdict"] != "done"
     assert "stats.py" in result["evidence"]["missing_evidence_paths"]
 
@@ -505,14 +509,37 @@ def test_missing_log_path_is_needs_input(tmp_path: Path) -> None:
     worktree = make_worktree(tmp_path)
     lane = make_lane(tmp_path, worktree=worktree)
     write_sidecar(worktree, "lane-a-d1", log_path="logs/lane-a.log")
-    assert run_probe(lane)["verdict"] == "needs_input"
+    assert run_probe(lane)["verdict"] == "evidence_unresolved"
+
+
+def test_confirmed_git_deletion_is_valid_evidence(tmp_path: Path) -> None:
+    worktree = make_worktree(tmp_path)
+    subprocess.run(["git", "-C", str(worktree), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(worktree), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(worktree), "config", "user.name", "Test"], check=True)
+    tracked = worktree / "removed.txt"
+    tracked.write_text("old\n")
+    subprocess.run(["git", "-C", str(worktree), "add", "removed.txt"], check=True)
+    subprocess.run(["git", "-C", str(worktree), "commit", "-m", "fixture"], check=True,
+                   capture_output=True)
+    tracked.unlink()
+    lane = make_lane(tmp_path, worktree=worktree)
+    write_sidecar(worktree, "lane-a-d1", files=("removed.txt",))
+    assert run_probe(lane)["verdict"] == "done"
+
+
+def test_unconfirmed_absent_path_is_evidence_unresolved(tmp_path: Path) -> None:
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree)
+    write_sidecar(worktree, "lane-a-d1", files=("never-created.txt",))
+    assert run_probe(lane)["verdict"] == "evidence_unresolved"
 
 
 def test_absolute_evidence_path_must_exist(tmp_path: Path) -> None:
     worktree = make_worktree(tmp_path)
     lane = make_lane(tmp_path, worktree=worktree)
     write_sidecar(worktree, "lane-a-d1", files=(str(tmp_path / "nowhere" / "x.py"),))
-    assert run_probe(lane)["verdict"] == "needs_input"
+    assert run_probe(lane)["verdict"] == "evidence_unresolved"
 
 
 def test_present_evidence_files_and_log_are_accepted(tmp_path: Path) -> None:
@@ -523,6 +550,31 @@ def test_present_evidence_files_and_log_are_accepted(tmp_path: Path) -> None:
     lane = make_lane(tmp_path, worktree=worktree)
     write_sidecar(worktree, "lane-a-d1", files=("stats.py", ".oprun"), log_path="logs/lane-a.log")
     assert run_probe(lane)["verdict"] == "done"
+
+
+@pytest.mark.parametrize("waiver", ["", "   ", "false", False, True, 1, {}, {"reason": ""}, {"reason": "   "}, {"reason": 1}])
+def test_empty_evidence_rejects_non_explicit_waivers(tmp_path: Path, waiver: object) -> None:
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree)
+    write_sidecar(worktree, "lane-a-d1", waiver=waiver)  # type: ignore[arg-type]
+    assert run_probe(lane)["verdict"] == "evidence_unresolved"
+
+
+def test_empty_evidence_accepts_string_or_reason_waiver(tmp_path: Path) -> None:
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree)
+    for waiver in ("no artifact is expected for this lane", {"reason": "not applicable"}):
+        write_sidecar(worktree, "lane-a-d1", waiver=waiver)  # type: ignore[arg-type]
+        assert run_probe(lane)["verdict"] == "done"
+
+
+def test_review_unavailable_is_reachable_from_sidecar(tmp_path: Path) -> None:
+    worktree = make_worktree(tmp_path)
+    lane = make_lane(tmp_path, worktree=worktree)
+    write_sidecar(worktree, "lane-a-d1", review_unavailable=True)
+    result = run_probe(lane)
+    assert result["verdict"] == "review_unavailable"
+    assert result["evidence"]["test_rc"] == 0
 
 
 # --- the ledger's own word ---------------------------------------------------
@@ -592,8 +644,9 @@ def test_sidecar_dir_argument_points_at_the_sidecar_directory(tmp_path: Path) ->
         "task_id": "lane-a", "dispatch_id": "lane-a-d1", "status": "success",
         "evidence": {"files": [], "log_path": ""},
     }))
-    assert probe.probe(lane, unit_active=False, timeout_exceeded=False,
-                       sidecar_dir=elsewhere)["verdict"] == "done"
+    result = probe.probe(lane, unit_active=False, timeout_exceeded=False,
+                          sidecar_dir=elsewhere)
+    assert result["verdict"] == "evidence_unresolved"
 
 
 # --- systemd lifetime --------------------------------------------------------

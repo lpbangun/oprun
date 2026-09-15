@@ -45,6 +45,102 @@ TERMINAL = {COMPLETED, FAILED, BLOCKED}
 #: The distinction is real: ``failed`` reads as "the mission broke", ``parked`` reads as "waiting
 #: for a decision" — which is what the ledger actually holds.
 PARKED = "parked"
+# Typed, re-enterable parks are scheduler outcomes, not product failures.
+REVIEW_UNAVAILABLE = "review_unavailable"
+EVIDENCE_UNRESOLVED = "evidence_unresolved"
+PARK_KINDS = frozenset({REVIEW_UNAVAILABLE, EVIDENCE_UNRESOLVED})
+
+
+def _evidence_files(value: object) -> list[object]:
+    """Normalize the evidence ``files`` field without ever iterating a scalar."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+
+def _evidence_paths(sidecar: dict) -> list[str]:
+    evidence = sidecar.get("evidence")
+    if not isinstance(evidence, dict):
+        evidence = {}
+    files = _evidence_files(evidence.get("files"))
+    paths = [item.strip() for item in files
+             if isinstance(item, str) and item.strip()]
+    log_path = evidence.get("log_path")
+    if isinstance(log_path, str) and log_path.strip():
+        paths.append(log_path.strip())
+    return paths
+
+
+def _git_status_paths(root: Path) -> set[str]:
+    """Return changed paths from NUL-delimited porcelain, conservatively."""
+    try:
+        proc = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "-z"],
+                              capture_output=True, timeout=GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    fields = proc.stdout.split(b"\x00")
+    paths: set[str] = set()
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if not field:
+            continue
+        # Porcelain -z emits rename/copy pairs as XY new\\0 old\\0; the new path is enough.
+        if len(field) >= 3:
+            paths.add(field[3:].decode("utf-8", "surrogateescape"))
+            if field[:2][0:1] in (b"R", b"C") and index < len(fields):
+                index += 1
+    return paths
+
+
+def missing_evidence_paths(sidecar: dict, root: Path, base: Path) -> list[str]:
+    """Return named evidence paths that neither exist nor are confirmed by git."""
+    confirmed = _git_status_paths(root)
+    missing: list[str] = []
+    for candidate in _evidence_paths(sidecar):
+        path = Path(candidate)
+        candidates = [path] if path.is_absolute() else [root / path, base / path]
+        if any(item.exists() for item in candidates):
+            continue
+        if not path.is_absolute() and candidate in confirmed:
+            continue
+        missing.append(candidate)
+    return missing
+
+
+def evidence_outcome(sidecar: dict, missing: list[str]) -> tuple[str, list[str]]:
+    """Return the shared typed outcome for sidecar evidence.
+
+    Evidence is fail-closed: a missing evidence object, or files without a non-empty
+    trimmed string path, requires a meaningful explicit waiver.
+    """
+    evidence = sidecar.get("evidence")
+    if not isinstance(evidence, dict):
+        evidence = {}
+    reviewer = evidence.get("reviewer")
+    if evidence.get("review_unavailable") is True or (
+            isinstance(reviewer, dict) and reviewer.get("available") is False):
+        return REVIEW_UNAVAILABLE, []
+    if missing:
+        return EVIDENCE_UNRESOLVED, missing
+    files = _evidence_files(evidence.get("files"))
+    has_files = any(isinstance(item, str) and bool(item.strip()) for item in files)
+    waiver = evidence.get("waiver")
+    valid_waiver = (
+        isinstance(waiver, str) and bool(waiver.strip())
+        and waiver.strip().casefold() != "false"
+    ) or (
+        isinstance(waiver, dict) and isinstance(waiver.get("reason"), str)
+        and bool(waiver["reason"].strip())
+    )
+    if not has_files and not valid_waiver:
+        return EVIDENCE_UNRESOLVED, missing
+    return "", missing
 
 TRANSITIONS: dict[tuple[str, str], str] = {
     (PENDING, "ready"): READY,
@@ -61,6 +157,8 @@ TRANSITIONS: dict[tuple[str, str], str] = {
     # ordinary dispatch gate re-enters it, and the worker is relaunched by the conductor — while the
     # failure streak it must never touch stays exactly where it was (issue #1).
     (DISPATCHED, "infra"): READY,
+    (DISPATCHED, EVIDENCE_UNRESOLVED): READY,
+    (DISPATCHED, REVIEW_UNAVAILABLE): READY,
     (FAILED, "retry"): DISPATCHED,
     (FAILED, "block"): BLOCKED,
     (BLOCKED, "retry"): DISPATCHED,
@@ -188,18 +286,20 @@ def _toplevel(worktree: Path) -> Path:
     return Path(root) if rc == 0 and root else Path(worktree)
 
 
-def _porcelain_paths(status: str) -> list[str]:
-    """Changed paths from ``status --porcelain``, renames resolved to the new name.
-
-    The output is sliced, never stripped as a whole first: the first line of a worktree-only change
-    begins with a space (``" M work.txt"``), and a blanket strip turns that path into ``ork.txt`` —
-    evidence that silently hashes a file that does not exist.
-    """
+def _porcelain_paths(status: bytes) -> list[str]:
+    """Changed paths from NUL-delimited porcelain, with renames resolved to the new name."""
+    fields = status.split(b"\x00")
     paths: list[str] = []
-    for line in status.splitlines():
-        if not line.strip():
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if not field:
             continue
-        paths.append(line[3:].strip().split(" -> ")[-1])
+        if len(field) >= 3:
+            paths.append(field[3:].decode("utf-8", "surrogateescape"))
+            if field[:2][0:1] in (b"R", b"C") and index < len(fields):
+                index += 1
     return paths
 
 
@@ -248,12 +348,12 @@ def git_evidence(worktree: Path | str, base_commit: str | None = None) -> dict:
     hashes for the newer work): the commit is not what the worktree currently holds.
     """
     worktree = Path(worktree)
-    rc_status, status, status_err = _git(worktree, "status", "--porcelain")
+    rc_status, status, status_err = _git(worktree, "status", "--porcelain", "-z")
     if rc_status != 0:
         return {"branch": _current_branch(worktree), "commit": None, "uncommitted": None,
                 "hashes": {},
                 "git_error": (status_err or status).strip() or f"git status exited {rc_status}"}
-    paths = _porcelain_paths(status)
+    paths = _porcelain_paths(status.encode("utf-8", "surrogateescape"))
     if paths:
         return {"branch": _current_branch(worktree), "commit": None, "uncommitted": True,
                 "hashes": _content_hashes(_toplevel(worktree), paths)}
@@ -487,7 +587,7 @@ class Ledger:
 
     def settle(self, lane_id: str, dispatch_id: str, ok: bool,
                evidence: dict | None = None, reason: str = "", infra: bool = False,
-               over_budget: bool = False) -> dict:
+               over_budget: bool = False, park_kind: str | None = None) -> dict:
         """Accept or reject one dispatch's outcome, and apply the circuit breaker.
 
         Fencing runs FIRST, before the duplicate check: a superseded dispatch is stale
@@ -523,6 +623,10 @@ class Ledger:
         declared has already proved too small, and a silent re-run of the same unchanged command
         would blow it again. Returns that settlement with an extra ``over_budget_count``.
         """
+        if park_kind is not None and park_kind not in PARK_KINDS:
+            raise ValueError(f"unknown typed park kind: {park_kind!r}")
+        if park_kind is not None and ok:
+            raise ValueError("a typed park cannot accept a lane")
         if infra and ok:
             raise ValueError("infra=True means no test verdict was reached: it cannot accept a lane")
         if over_budget and ok:
@@ -554,6 +658,21 @@ class Ledger:
             # the lane must still be mid-flight for a settlement to mean anything
             if lane["status"] != DISPATCHED:
                 return reject(f"lane is {lane['status']!r}, not dispatched")
+
+            if park_kind is not None:
+                # Typed parks are re-enterable scheduler outcomes. Preserve the product failure
+                # streak and return to READY so the same logical lane can be dispatched again.
+                park_evidence = dict(evidence) if evidence else {}
+                park_evidence.setdefault("park_kind", park_kind)
+                park_evidence.setdefault("blocked_reason", reason or park_kind)
+                self._move(lane, park_kind, apply(lane["status"], park_kind))
+                lane["blocked_reason"] = f"{park_kind}: {reason or park_kind}"
+                lane["evidence"] = park_evidence
+                lane["accepted"].append(dispatch_id)
+                self._write()
+                return {"accepted": True, "status": lane["status"],
+                        "consecutive_failures": lane["consecutive_failures"],
+                        "park_kind": park_kind}
 
             if over_budget:
                 # A park that is deliberately NOT the failure transition: the lane's tests never

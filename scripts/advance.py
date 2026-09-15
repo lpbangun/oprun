@@ -71,7 +71,8 @@ from typing import Callable, NamedTuple
 # The ONE git-evidence builder lives in the ledger, next to the lane records whose ``base_commit``
 # anchor it needs: this module used to carry its own copy, and that copy named the worktree's HEAD
 # (the shared base SHA, for a lane that never committed) as the lane's ``commit``.
-from ledger import BLOCKED, TERMINAL, Ledger, git_evidence
+from ledger import (BLOCKED, TERMINAL, Ledger, git_evidence, evidence_outcome,
+                    missing_evidence_paths, EVIDENCE_UNRESOLVED, REVIEW_UNAVAILABLE)
 
 import launch  # sibling module: the only detach/lifetime authority (scripts/launch.py)
 # The identity rule — did this lane run the model and harness the ledger designated? — lives with
@@ -293,6 +294,8 @@ def _validate_sidecar(payload: dict, lane_id: str, dispatch_id: str) -> str:
     return ""
 
 
+
+
 def _sidecar_facts(payload: dict) -> dict:
     """A compact verbatim excerpt of the worker's sidecar (never a rewrite of it)."""
     return {
@@ -365,6 +368,17 @@ def lane_verdict(lane: dict, *, lane_id: str = "", unit_active: bool | None = No
                                model_reported=payload.get("model"))
     if identity:
         return {"verdict": FAILED_VERDICT, "reason": identity, "case": "unusable_artifact",
+                "evidence": found}
+    # Evidence policy is shared with probe.py and remains available if probe itself is absent.
+    missing = missing_evidence_paths(payload, worktree, directory)
+    park_kind, missing = evidence_outcome(payload, missing)
+    found["missing_evidence_paths"] = missing
+    if park_kind:
+        found["park_kind"] = park_kind
+        reason = ("reviewer is unavailable" if park_kind == REVIEW_UNAVAILABLE else
+                  (f"evidence paths do not resolve: {missing!r}" if missing else
+                   "green sidecar has neither an artifact nor an explicit waiver"))
+        return {"verdict": park_kind, "reason": reason, "case": "unusable_artifact",
                 "evidence": found}
     return {"verdict": DONE, "reason": f"{path.name} matches dispatch {dispatch_id!r}",
             "case": "ok", "evidence": found}
@@ -502,7 +516,8 @@ def _append_unique(items: list[str], value: str) -> None:
 
 def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, reason: str,
                  emit: Callable[[str], None], *, verdict: dict | None = None,
-                 witness: dict | None = None, exit_code: int | None = None) -> _Decision:
+                 witness: dict | None = None, exit_code: int | None = None,
+                 park_kind: str | None = None) -> _Decision:
     """Refuse an outcome: the lane goes to ``needs_review`` — and never to ``completed``.
 
     The advisory ``identity_warning`` travels with the park: a lane can be parked for a model
@@ -529,7 +544,10 @@ def _settle_park(led: Ledger, lane_id: str, dispatch_id: str, category: str, rea
         "witness": witness,
         "checked_at": _utc_now(),
     }
-    result = led.settle(lane_id, dispatch_id, False, evidence=evidence, reason=reason)
+    if park_kind not in (EVIDENCE_UNRESOLVED, REVIEW_UNAVAILABLE):
+        park_kind = None
+    result = led.settle(lane_id, dispatch_id, False, evidence=evidence, reason=reason,
+                        park_kind=park_kind)
     if not result.get("accepted"):
         emit(f"[{lane_id}] SETTLE_REFUSED {result.get('reason')}")
         return _Decision(lane_id, "parked", "evidence",
@@ -697,8 +715,9 @@ def _attempt_lane(led: Ledger, lane_id: str, *, deadline: float,
         return _settle_no_evidence(led, lane_id, dispatch_id, lifetime=lifetime, verdict=verdict,
                                    witness=witness, emit=emit)
     if verdict["verdict"] != DONE:
+        park_kind = verdict["verdict"] if verdict["verdict"] in (EVIDENCE_UNRESOLVED, REVIEW_UNAVAILABLE) else None
         return _settle_park(led, lane_id, dispatch_id, "evidence", verdict["reason"], emit,
-                            verdict=verdict, witness=witness)
+                            verdict=verdict, witness=witness, park_kind=park_kind)
 
     # Evidence is complete. The controller now re-runs the lane's OWN test command: the sidecar
     # says the worker believes it succeeded, this says it actually did. The run gets the acceptance

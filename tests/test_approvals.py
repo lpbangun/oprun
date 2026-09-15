@@ -74,12 +74,31 @@ def read_ledger(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def write_success_sidecar(scratch: dict, dispatch_id: str, lane: str = "alpha") -> None:
+    """Give acceptance tests the worker witness required by the settled contract."""
+    directory = scratch["worktree"] / ".oprun"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"result.{dispatch_id}.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "task_id": lane,
+        "dispatch_id": dispatch_id,
+        "status": "success",
+        "harness": "cursor-agent",
+        "model": "cursor-grok-4.6",
+        "exit_code": 0,
+        "evidence": {"files": [], "waiver": "approval envelope fixture"},
+    }), encoding="utf-8")
+
+
 def dispatch_lane(scratch: dict, lane: str = "alpha") -> str:
-    """Register + dispatch one lane in the ledger. No process is launched (no live systemd)."""
+    """Register + dispatch one lane and write its test witness. No process is launched."""
     ledger = Ledger(scratch["ledger"], max_parallel=4, failure_limit=3)
     ledger.init_lane(lane, harness="cursor-agent", worktree=str(scratch["worktree"]),
                      test_cmd=["true"], model="cursor-grok-4.6")
-    return ledger.dispatch(lane)
+    dispatch_id = ledger.dispatch(lane)
+    write_success_sidecar(scratch, dispatch_id, lane)
+    return dispatch_id
 
 
 @pytest.fixture()
@@ -258,6 +277,26 @@ def test_accept_refuses_when_the_lane_test_is_red(scratch: dict) -> None:
     assert "Traceback" not in proc.stderr
     assert git(scratch["worktree"], "rev-parse", "HEAD") == base
     assert read_ledger(scratch["ledger"])["lanes"]["red"]["status"] == "dispatched"
+
+
+def test_settle_refuses_missing_sidecar_before_any_git_side_effect(scratch: dict) -> None:
+    """A green test with no worker witness cannot consume an approval envelope."""
+    assert run_cli("init", str(scratch["repo"]), "--mission", "m",
+                   "--approve", "commit,push,merge").returncode == 0
+    dispatch_id = dispatch_lane(scratch)
+    sidecar_path = scratch["worktree"] / ".oprun" / f"result.{dispatch_id}.json"
+    sidecar_path.unlink()
+    base = git(scratch["worktree"], "rev-parse", "HEAD")
+
+    proc = run_cli("settle", "alpha", "--accept", "--ledger", str(scratch["ledger"]))
+
+    assert proc.returncode != 0
+    assert git(scratch["worktree"], "rev-parse", "HEAD") == base
+    assert not git_ok(scratch["remote"], "rev-parse", "--verify", "refs/heads/alpha")
+    lane = read_ledger(scratch["ledger"])["lanes"]["alpha"]
+    assert lane["status"] == "ready"
+    assert lane["evidence"]["park_kind"] == "evidence_unresolved"
+    assert "no sidecar" in lane["evidence"]["reason"]
 
 
 # --- envelope absent: ask exactly once, and closed stdin means no -------------

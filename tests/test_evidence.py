@@ -27,6 +27,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 CLI = SCRIPTS / "oprun.py"
 if str(SCRIPTS) not in sys.path:
@@ -69,12 +71,15 @@ def run_cli(*args: str) -> subprocess.CompletedProcess:
                           stdin=subprocess.DEVNULL, timeout=180, env=GIT_ENV)
 
 
-def _sidecar(worktree: Path, dispatch_id: str, lane_id: str) -> Path:
+def _sidecar(worktree: Path, dispatch_id: str, lane_id: str, *, evidence: object = None) -> Path:
     """The artifact a worker would leave: written atomically, at the exact path, claiming the run."""
     directory = worktree / advance.SIDECAR_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
+    if evidence is None:
+        evidence = {"files": [], "waiver": "fixture has no artifact files"}
     payload = {"schema_version": 1, "task_id": lane_id, "dispatch_id": dispatch_id,
-               "status": "success", "harness": LANE_HARNESS, "model": LANE_MODEL, "exit_code": 0}
+               "status": "success", "harness": LANE_HARNESS, "model": LANE_MODEL, "exit_code": 0,
+               "evidence": evidence}
     target = directory / f"{advance.SIDECAR_PREFIX}{dispatch_id}{advance.SIDECAR_SUFFIX}"
     tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -123,6 +128,16 @@ def _lane_evidence(ledger_path: Path, lane_id: str) -> dict:
 
 
 # --- 1. the unattended path: uncommitted work names no commit ----------------
+@pytest.mark.parametrize("bad_files", [5, True, 1.5, "", ["", 5]])
+def test_scalar_or_blank_files_are_unresolved_on_both_witness_paths(tmp_path: Path, bad_files: object) -> None:
+    mission = _mission(tmp_path, lane_id=f"bad-{str(bad_files).replace('.', '_')}")
+    lane = mission["lane"]
+    _sidecar(mission["worktree"], mission["dispatch_id"], lane, evidence={"files": bad_files})
+    direct = advance.lane_verdict(mission["ledger"].lane(lane), lane_id=lane)
+    assert direct["verdict"] == advance.EVIDENCE_UNRESOLVED
+    assert advance.advance(mission["ledger_path"], timeout=10, poll=0.01, emit=lambda _: None)["accepted"] == []
+
+
 def test_advance_records_no_commit_for_a_lane_that_did_not_commit(tmp_path: Path) -> None:
     mission = _mission(tmp_path)
     worktree, base_sha = mission["worktree"], mission["base_sha"]
@@ -231,6 +246,34 @@ def _grant(mission: dict, *keys: str) -> None:
     """Record the envelope through the real CLI, exactly as an operator would."""
     proc = run_cli("approve", "--grant", ",".join(keys), "--ledger", str(mission["ledger_path"]))
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("evidence", [{}, {"files": 5}, {"files": ["", 7]}])
+def test_settle_accept_refuses_missing_or_malformed_evidence_before_commit(tmp_path: Path, evidence: dict) -> None:
+    mission = _mission(tmp_path, ignore_evidence=False)
+    worktree, lane = mission["worktree"], mission["lane"]
+    (worktree / "lane.txt").write_text("lane work\n", encoding="utf-8")
+    _sidecar(worktree, mission["dispatch_id"], lane, evidence=evidence)
+    _grant(mission, "commit")
+
+    proc = run_cli("settle", lane, "--accept", "--ledger", str(mission["ledger_path"]))
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert git(worktree, "rev-parse", "HEAD") == mission["base_sha"]
+    record = _lane_record(mission["ledger_path"], lane)
+    assert record["status"] == "ready"
+    assert record["evidence"]["park_kind"] == "evidence_unresolved"
+
+
+def test_settle_accept_allows_valid_waiver(tmp_path: Path) -> None:
+    mission = _mission(tmp_path, ignore_evidence=False)
+    worktree, lane = mission["worktree"], mission["lane"]
+    (worktree / "lane.txt").write_text("lane work\n", encoding="utf-8")
+    _sidecar(worktree, mission["dispatch_id"], lane, evidence={"files": [], "waiver": "no artifact by design"})
+    _grant(mission, "commit")
+
+    proc = run_cli("settle", lane, "--accept", "--ledger", str(mission["ledger_path"]))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert git(worktree, "rev-parse", "HEAD") != mission["base_sha"]
 
 
 def test_settle_commit_contains_no_lane_evidence_path(tmp_path: Path) -> None:

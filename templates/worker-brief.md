@@ -25,7 +25,15 @@ It must be one JSON object with exactly these top-level keys:
     exit_code        0 iff status is "success", else non-zero
     evidence         {"branch": "...", "commit": "<sha or null>", "files": ["..."],
                       "test_count": <int>, "test_result": "pass"|"fail",
-                      "log_path": "<path or empty string>"}
+                      "log_path": "<path or empty string>",
+                      "waiver": "non-empty reason" | {"reason": "non-empty reason"}}
+
+    If no evidence files are produced, include exactly one explicit non-empty `waiver` (string or
+    object reason). Do not use blank, boolean, numeric, or empty values. Blank/non-string `files`
+    entries do not count as artifacts. A missing `evidence` object is unresolved and will be parked
+    as `evidence_unresolved`. If an independent reviewer cannot run, record `review_unavailable: true`
+    (or `reviewer: {"available": false}`) with the reviewer-unavailable context; this is a typed
+    park, not acceptance evidence.
     summary          <= 500 characters, plain text, what you actually did
     finished_at      ISO-8601 UTC, e.g. "2026-09-11T20:03:10Z"
 

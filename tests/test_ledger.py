@@ -53,6 +53,8 @@ class TestTransitionTable:
         assert apply(FAILED, "retry") == DISPATCHED
         assert apply(BLOCKED, "unblock") == READY
         assert apply(COMPLETED, "reopen") == READY
+        assert apply(DISPATCHED, "evidence_unresolved") == READY
+        assert apply(DISPATCHED, "review_unavailable") == READY
         assert TERMINAL == {COMPLETED, FAILED, BLOCKED}
 
     def test_illegal_pairs_raise_never_guess(self):
@@ -268,6 +270,37 @@ class TestLedgerCase:
         d = led.dispatch("lane-a")
         assert led.settle("lane-a", d, ok=True)["accepted"]
         assert led.lane("lane-a")["evidence"] == {}
+
+    def test_typed_park_returns_ready_without_failure_streak(self, led):
+        _init(led, "lane-park")
+        d = led.dispatch("lane-park")
+        result = led.settle("lane-park", d, ok=False, reason="missing artifact",
+                            evidence={"verdict": "evidence_unresolved"},
+                            park_kind="evidence_unresolved")
+        lane = led.lane("lane-park")
+        assert result["status"] == READY
+        assert lane["status"] == READY
+        assert lane["consecutive_failures"] == 0
+        assert lane["evidence"]["park_kind"] == "evidence_unresolved"
+        assert lane["history"][-1]["event"] == "evidence_unresolved"
+        assert (lane["history"][-1]["from"], lane["history"][-1]["to"]) == (DISPATCHED, READY)
+        base_commit = lane["base_commit"]
+        assert led.dispatch("lane-park") == "lane-park-d2"
+        assert led.lane("lane-park")["base_commit"] == base_commit
+
+    def test_review_unavailable_park_is_typed_and_reenterable(self, led):
+        _init(led, "lane-review")
+        d = led.dispatch("lane-review")
+        base_commit = led.lane("lane-review")["base_commit"]
+        result = led.settle("lane-review", d, ok=False, reason="reviewer unavailable",
+                            evidence={"verdict": "review_unavailable",
+                                      "reviewer": {"available": False}},
+                            park_kind="review_unavailable")
+        assert result["status"] == READY
+        assert led.lane("lane-review")["consecutive_failures"] == 0
+        assert led.lane("lane-review")["evidence"]["park_kind"] == "review_unavailable"
+        assert led.dispatch("lane-review") == "lane-review-d2"
+        assert led.lane("lane-review")["base_commit"] == base_commit
 
     def test_rejected_settles_are_recorded_on_the_lane(self, led):
         _init(led, "lane-a")

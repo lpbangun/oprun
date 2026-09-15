@@ -69,6 +69,10 @@ from ledger import (  # noqa: E402  (sibling: the only lane-status authority)
     ParallelismExceeded,
     display_state,
     git_evidence,
+    evidence_outcome,
+    missing_evidence_paths,
+    EVIDENCE_UNRESOLVED,
+    REVIEW_UNAVAILABLE,
 )
 
 # --- frozen vocabulary -------------------------------------------------------
@@ -786,10 +790,9 @@ def _resolve_test_program(test_cmd: list[str]) -> str | None:
 def _current_sidecar(worktree: Path, dispatch_id: str) -> tuple[dict | None, str]:
     """The lane's sidecar for its CURRENT dispatch: ``(document, problem)``.
 
-    ``(None, "")`` — there is no sidecar at all, so no identity was reported and there is nothing
-    to contradict. The check never invents a claim on the worker's behalf: whether an
-    artifact-less lane may be accepted at all is decided by the controller's own re-run of
-    ``test_cmd``, elsewhere.
+    ``(None, "")`` — there is no sidecar at all, so no identity was reported. The acceptance
+    path treats that as unresolved evidence; it never invents a worker result from the controller's
+    own test re-run.
 
     ``(None, why)`` — a file exists at the exact path but is not a readable JSON object. That is
     an *unusable* artifact, not an absent one, and an unusable artifact is never accepted.
@@ -1242,7 +1245,8 @@ def _settle_needs_review(args: argparse.Namespace, led: Ledger, lane: dict,
 
 
 def _settle_refused(args: argparse.Namespace, led: Ledger, dispatch_id: str, worktree: Path,
-                    reason: str, identity: dict, *, identity_warning: str = "") -> int:
+                    reason: str, identity: dict, *, identity_warning: str = "",
+                    park_kind: str | None = None) -> int:
     """Park a lane the controller REFUSED to accept. **Performs no git mutation at all.**
 
     A refused ``--accept`` is a settlement, not a state the operator has to fix by hand: the
@@ -1266,7 +1270,8 @@ def _settle_refused(args: argparse.Namespace, led: Ledger, dispatch_id: str, wor
         "identity_warning": identity_warning,
         **git_evidence(worktree, led.lane(args.lane).get("base_commit")),
     }
-    result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=reason)
+    result = led.settle(args.lane, dispatch_id, False, evidence=evidence, reason=reason,
+                        park_kind=park_kind)
     if not result.get("accepted"):
         raise CLIError(f"ledger refused the settlement: {result.get('reason')}", EXIT_ILLEGAL)
     if identity_warning:
@@ -1367,6 +1372,33 @@ def cmd_settle(args: argparse.Namespace) -> int:
             f"(use --needs-review). output tail: {tail[-200:]!r}",
             EXIT_ERROR,
         )
+
+    # 3b. Apply the same fail-closed evidence policy as probe and advance BEFORE any green
+    #     settlement or git side effect. A reviewer-unavailable result is a typed re-enterable park,
+    #     not product success; unresolved/malformed evidence uses the same refusal path. An absent
+    #     sidecar is itself unresolved evidence: the controller's green test cannot stand in for the
+    #     worker's required witness.
+    missing_evidence: list[str] = []
+    if document is None:
+        park_kind = EVIDENCE_UNRESOLVED
+    else:
+        missing_evidence = missing_evidence_paths(document, worktree, worktree / SIDECAR_DIRNAME)
+        park_kind, missing_evidence = evidence_outcome(document, missing_evidence)
+    if park_kind:
+        evidence_identity = _identity_fields(lane, worktree, str(dispatch_id), document)
+        evidence_identity.update({"missing_evidence_paths": missing_evidence,
+                                  "park_kind": park_kind})
+        if document is None:
+            detail = "current dispatch has no sidecar; worker evidence is unresolved"
+        elif park_kind == REVIEW_UNAVAILABLE:
+            detail = "reviewer is unavailable"
+        elif missing_evidence:
+            detail = f"evidence paths do not resolve: {missing_evidence!r}"
+        else:
+            detail = "green sidecar has neither an artifact nor an explicit waiver"
+        return _settle_refused(args, led, str(dispatch_id), worktree, detail,
+                               evidence_identity, identity_warning=warning,
+                               park_kind=park_kind)
 
     branch = _current_branch(worktree)
     planned = _planned_actions(worktree, branch)

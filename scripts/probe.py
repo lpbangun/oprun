@@ -42,11 +42,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
-from ledger import BLOCKED, DISPATCHED, FAILED, Ledger
+from ledger import (BLOCKED, DISPATCHED, EVIDENCE_UNRESOLVED, FAILED, Ledger,
+                    REVIEW_UNAVAILABLE, evidence_outcome, missing_evidence_paths)
 
-#: The complete verdict vocabulary. Every return value of :func:`probe` is one of these.
+#: The complete verdict vocabulary. Typed parks are deliberately distinct from a red product test.
 #:
 #: ``infra`` is the environment failing, never a red test: the controller could not RUN the lane's
 #: acceptance command at all — the program is not on PATH, or a lane that declared no budget of its
@@ -58,7 +59,8 @@ from ledger import BLOCKED, DISPATCHED, FAILED, Ledger
 #: (``test_timeout_s``, written at dispatch) and its command exceeded it. No test was proven red
 #: either, so it is neither ``infra`` (nothing in the environment failed) nor a failure: it parks
 #: through the human-review path, touches no failure streak and gets no infra retry.
-VERDICTS = ("done", "infra", "over_budget", "pending", "needs_input", "stalled", "failed")
+VERDICTS = ("done", "infra", "over_budget", "pending", "needs_input", "stalled", "evidence_unresolved", "review_unavailable", "failed")
+
 
 #: Registry ids, matching ``harnesses.py``. Every shipped harness must be mapped below: an
 #: unmapped harness that reached :func:`probe` would be silently treated as success.
@@ -339,17 +341,6 @@ def _sidecar_path(base: Path, dispatch_id: str | None) -> Path | None:
     return base / SIDECAR_TEMPLATE.format(dispatch_id=dispatch_id)
 
 
-def _relative_candidates(candidate: str, root: Path, base: Path) -> Iterator[Path]:
-    """Resolution order for an evidence path: the lane root first, the sidecar dir as fallback."""
-    path = Path(candidate)
-    if path.is_absolute():
-        yield path
-        return
-    yield root / path
-    if base != root:
-        yield base / path
-
-
 def _roots(lane: dict, base: Path) -> Path:
     """The lane root evidence paths are relative to (the worktree, else the sidecar's parent)."""
     worktree = lane.get("worktree")
@@ -358,27 +349,9 @@ def _roots(lane: dict, base: Path) -> Path:
     return base.parent
 
 
-def _missing_evidence_paths(sidecar: dict, root: Path, base: Path) -> list[str]:
-    """Every evidence path named by ``sidecar`` that does not resolve on disk.
-
-    ``evidence.files`` is a list; ``evidence.log_path`` is checked only when non-empty (the canary
-    sidecars ship an empty string, which means "no log", not "a missing file").
-    """
-    evidence = sidecar.get("evidence")
-    if not isinstance(evidence, dict):
-        evidence = {}
-    files = evidence.get("files") or []
-    if isinstance(files, str):
-        files = [files]
-    candidates = [str(item) for item in files if str(item).strip()]
-    log_path = str(evidence.get("log_path") or "").strip()
-    if log_path:
-        candidates.append(log_path)
-    missing: list[str] = []
-    for candidate in candidates:
-        if not any(path.exists() for path in _relative_candidates(candidate, root, base)):
-            missing.append(candidate)
-    return missing
+def _evidence_unresolved(sidecar: dict, root: Path, base: Path) -> tuple[str, list[str]]:
+    """Compatibility wrapper around the shared evidence policy."""
+    return evidence_outcome(sidecar, missing_evidence_paths(sidecar, root, base))
 
 
 def recorded_test_timeout_s(lane: dict) -> float | None:
@@ -689,11 +662,15 @@ def probe(lane: dict, *, unit_active: bool, timeout_exceeded: bool,
                        f"controller re-run of test_cmd exited {rc} "
                        f"({test_cmd!r}): {tail[-200:]!r}")
 
-    # 5. every evidence path must resolve.
-    missing = _missing_evidence_paths(sidecar, root, base)
+    # 5. evidence must contain an artifact, or an explicit ledger-recorded waiver.
+    park_kind, missing = _evidence_unresolved(sidecar, root, base)
     evidence["missing_evidence_paths"] = missing
-    if missing:
-        return verdict("needs_input", f"evidence paths do not resolve: {missing!r}")
+    if park_kind:
+        evidence["park_kind"] = park_kind
+        reason = ("reviewer is unavailable" if park_kind == REVIEW_UNAVAILABLE else
+                  (f"evidence paths do not resolve: {missing!r}" if missing else
+                   "green sidecar has neither an artifact nor an explicit waiver"))
+        return verdict(park_kind, reason)
 
     return verdict("done", "sidecar + current dispatch + test_cmd rc=0 + evidence paths all verified")
 

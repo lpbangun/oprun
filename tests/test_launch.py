@@ -75,7 +75,8 @@ def _sidecar(worktree: Path, dispatch_id: str, *, status: str = "success",
     directory = worktree / advance.SIDECAR_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": 1, "dispatch_id": dispatch_id, "status": status,
-               "harness": "cursor-agent", "model": "cursor-grok-4.6", "exit_code": 0}
+               "harness": "cursor-agent", "model": "cursor-grok-4.6", "exit_code": 0,
+               "evidence": {"files": [], "waiver": "fixture has no artifact files"}}
     if task_id is not None:
         payload["task_id"] = task_id
     payload.update(extra or {})

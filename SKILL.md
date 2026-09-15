@@ -61,9 +61,9 @@ one, stop and rebrief it.
 2. `task_id` and `dispatch_id` in the sidecar match that lane and that dispatch;
 3. `status == "success"`;
 4. the controller re-runs the lane's own `test_cmd` and it exits 0;
-5. every evidence path the sidecar names resolves on disk.
+5. every evidence path the sidecar names resolves on disk; or the sidecar contains an explicit non-empty waiver in its evidence object when no artifact path is produced.
 
-Anything else is `needs_input`, `stalled`, `pending` or `failed` — never `done`. A dead unit with a
+A missing evidence object, blank/non-string file entries, or a blank waiver is unresolved evidence. It is a typed `evidence_unresolved` park, never acceptance. A reviewer-unavailable marker is the separate typed `review_unavailable` park. Anything else is `needs_input`, `stalled`, `pending` or `failed` — never `done`. A dead unit with a
 valid sidecar can be done; a live unit with no sidecar is not. **systemd answers process lifetime,
 never lane state.**
 
@@ -136,7 +136,7 @@ cadence.**
 1. **Probe after every other conductor step.** After `init`, after each `dispatch`, after each
    `settle`, after any user turn inside the run, and before you answer the user, run `probe <lane>`
    for every lane the ledger holds. The verdict is one deterministic word
-   (`done|infra|over_budget|pending|needs_input|stalled|failed`) — cheap enough to spend, and the
+   (`done|infra|over_budget|evidence_unresolved|review_unavailable|pending|needs_input|stalled|failed`) — cheap enough to spend, and the
    only thing that speaks for a lane. `status`, `systemctl` and pane text are context, never the
    verdict. Probing an already-`done` lane is free, so cost is never a reason not to look.
 2. **Wait bounded, never open.** `probe <lane> --wait --timeout 900` polls until the verdict is no

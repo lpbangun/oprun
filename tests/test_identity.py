@@ -56,7 +56,7 @@ if str(SCRIPTS) not in sys.path:
 import advance  # noqa: E402  (sibling: the bounded runner)
 import harnesses  # noqa: E402  (sibling: the registry + the identity rule)
 import oprun  # noqa: E402  (sibling: the CLI)
-from ledger import COMPLETED, FAILED, Ledger  # noqa: E402
+from ledger import COMPLETED, EVIDENCE_UNRESOLVED, FAILED, Ledger  # noqa: E402
 
 #: A test command that passes, run through the same interpreter as the suite.
 TEST_PASS = [sys.executable, "-c", "raise SystemExit(0)"]
@@ -90,7 +90,8 @@ def sidecar(worktree: Path, dispatch_id: str, *, lane: str = "alpha",
     directory = worktree / advance.SIDECAR_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
     payload: dict = {"schema_version": 1, "task_id": lane, "dispatch_id": dispatch_id,
-                     "status": status, "harness": harness, "model": model, "exit_code": 0}
+                     "status": status, "harness": harness, "model": model, "exit_code": 0,
+                     "evidence": {"files": [], "waiver": "fixture has no artifact files"}}
     for key in omit:
         payload.pop(key, None)
     target = advance.sidecar_path(worktree, dispatch_id)
@@ -329,20 +330,18 @@ def test_a_matching_identity_is_accepted_with_both_raw_strings_recorded(tmp_path
         assert result.returncode == 0, result.stderr
 
 
-# --- the artifact-less lane: no reported identity, so nothing is invented ----
-def test_settle_never_invents_an_identity_when_there_is_no_sidecar(tmp_path: Path):
-    """No sidecar means no reported identity — the check cannot claim one on the worker's behalf.
-
-    ``settle --accept`` is then decided by the controller's own re-run of ``test_cmd`` (the behaviour
-    ``tests/test_approvals.py`` freezes), and the evidence records that nothing was reported.
-    """
+# --- the artifact-less lane: no worker witness, no acceptance ----------------
+def test_settle_refuses_to_accept_when_there_is_no_sidecar(tmp_path: Path):
+    """A passing controller test cannot replace the worker's required sidecar witness."""
     fixture = mission(tmp_path, harness="codex", model="gpt-5.6-sol")
 
     result = accept("settle", fixture)
     lane = lane_record(fixture)
 
-    assert result.returncode == 0, result.stderr
-    assert lane["status"] == COMPLETED
+    assert result.returncode != 0, result.stderr
+    assert lane["status"] == "ready"
+    assert lane["evidence"]["park_kind"] == EVIDENCE_UNRESOLVED
+    assert "no sidecar" in lane["evidence"]["reason"]
     assert lane["evidence"]["model_reported"] is None
     assert lane["evidence"]["harness_reported"] is None
 

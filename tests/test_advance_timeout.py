@@ -69,7 +69,7 @@ def _sidecar(worktree: Path, dispatch_id: str, *, lane_id: str = "L3",
     directory.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": 1, "task_id": lane_id, "dispatch_id": dispatch_id,
                "status": status, "harness": "cursor-agent", "model": "cursor-grok-4.6",
-               "exit_code": 0}
+               "exit_code": 0, "evidence": {"files": [], "waiver": "fixture has no artifact files"}}
     target = directory / f"{advance.SIDECAR_PREFIX}{dispatch_id}{advance.SIDECAR_SUFFIX}"
     tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
